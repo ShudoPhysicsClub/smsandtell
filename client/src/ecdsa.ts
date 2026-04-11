@@ -264,19 +264,12 @@ export function getPublicKey(privKey: bigint): { x: bigint; y: bigint } {
   return pub
 }
 
-// メッセージを組み立てる: challenge || timestamp(8 bytes big-endian) || phone_number
+// メッセージを組み立てる: challenge || timestamp(10進数文字列) || phone_number
+// サーバー（gateway/auth.go）の形式に合わせてタイムスタンプは10進数文字列として結合する
 export function buildSignMessage(challenge: string, timestamp: number, phone: string): Uint8Array {
   const enc = new TextEncoder()
-  const challengeBytes = enc.encode(challenge)
-  const phoneBytes = enc.encode(phone)
-  // タイムスタンプを8バイトビッグエンディアンに変換
-  const tsBytes = bigIntToBytes(BigInt(timestamp), 8)
-
-  const result = new Uint8Array(challengeBytes.length + 8 + phoneBytes.length)
-  result.set(challengeBytes, 0)
-  result.set(tsBytes, challengeBytes.length)
-  result.set(phoneBytes, challengeBytes.length + 8)
-  return result
+  // サーバー側: []byte(challenge + fmt.Sprintf("%d", timestamp) + phone)
+  return enc.encode(challenge + String(timestamp) + phone)
 }
 
 // パスワードと電話番号からプライベートキーを生成（デモ用）

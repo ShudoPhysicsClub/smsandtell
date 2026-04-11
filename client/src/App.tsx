@@ -66,8 +66,10 @@ const App: React.FC = () => {
           {nodes.length > 0 && (
             <span style={styles.nodeLabel}>ノード: {nodes.length}件</span>
           )}
-          {/* privateKeyは署名時に使用済み（表示不要） */}
-          {privateKey !== null && null}
+          {/* 秘密鍵がメモリに保持されていることをインジケーターで表示 */}
+          {privateKey !== null && (
+            <span style={styles.keyIndicator} title="秘密鍵を保持中">🔑</span>
+          )}
           <button onClick={handleLogout} style={styles.logoutButton}>
             ログアウト
           </button>
@@ -140,6 +142,9 @@ const styles: Record<string, React.CSSProperties> = {
     backgroundColor: '#333',
     padding: '2px 8px',
     borderRadius: '12px',
+  },
+  keyIndicator: {
+    fontSize: '14px',
   },
   logoutButton: {
     padding: '6px 14px',

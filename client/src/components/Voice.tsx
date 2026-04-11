@@ -299,7 +299,7 @@ const Voice: React.FC<VoiceProps> = ({ phone, token, conn }) => {
       {callState === 'connected' && (
         <div style={styles.statusBox}>
           <p style={styles.statusText}>
-            🔊 通話中: {callState === 'connected' && (callTo || incomingFrom)}
+            🔊 通話中: {callTo || incomingFrom}
           </p>
           <p style={styles.callId}>通話ID: {currentCallId}</p>
           <button onClick={handleHangup} style={styles.hangupButton}>
