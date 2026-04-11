@@ -36,8 +36,8 @@ const Login: React.FC<LoginProps> = ({ onLogin }) => {
     setError('')
 
     try {
-      // ステップ1: パスワードから秘密鍵を生成
-      const privKey = deriveKeyFromPassword(password, phone)
+      // ステップ1: PBKDF2でパスワードから秘密鍵を生成
+      const privKey = await deriveKeyFromPassword(password, phone)
 
       // ステップ2: 秘密鍵から公開鍵を生成
       const pubKey = getPublicKey(privKey)

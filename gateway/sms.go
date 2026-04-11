@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 )
 
 // smsRequest はSMS送信リクエストのJSON構造体
@@ -104,17 +105,17 @@ func HandleSMSSend(w http.ResponseWriter, r *http.Request) {
 // extractNetworkPrefix は電話番号の上2桁からネットワーク識別子を返す
 func extractNetworkPrefix(phone string) string {
 	// ハイフンや+を除いた先頭2文字を取得
-	digits := ""
+	var sb strings.Builder
 	for _, c := range phone {
 		if c >= '0' && c <= '9' {
-			digits += string(c)
-			if len(digits) >= 2 {
+			sb.WriteRune(c)
+			if sb.Len() >= 2 {
 				break
 			}
 		}
 	}
-	if len(digits) < 2 {
+	if sb.Len() < 2 {
 		return "00"
 	}
-	return digits
+	return sb.String()
 }

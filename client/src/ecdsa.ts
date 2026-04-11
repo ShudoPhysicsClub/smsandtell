@@ -109,10 +109,9 @@ function bigIntToBytes(n: bigint, len: number): Uint8Array {
 }
 
 // SHA-256ハッシュ（WebCrypto API使用）
-// 入力をArrayBufferにコピーしてWebCrypto APIに渡す
 async function sha256(data: Uint8Array): Promise<Uint8Array<ArrayBuffer>> {
-  const copy = new Uint8Array(data)
-  const hashBuffer = await crypto.subtle.digest('SHA-256', copy)
+  // TypeScript型制約のためArrayBufferにキャストして渡す
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data.buffer as ArrayBuffer)
   return new Uint8Array(hashBuffer)
 }
 
@@ -272,24 +271,34 @@ export function buildSignMessage(challenge: string, timestamp: number, phone: st
   return enc.encode(challenge + String(timestamp) + phone)
 }
 
-// パスワードと電話番号からプライベートキーを生成（デモ用）
-// 実際の運用ではPBKDF2/Argon2を使用すること
-export function deriveKeyFromPassword(password: string, phone: string): bigint {
-  // パスワード + 電話番号をUTF-8エンコードして連結
+// パスワードと電話番号からプライベートキーをPBKDF2で生成
+// salt: 電話番号をUTF-8エンコードしたバイト列
+// iterations: 200000回（ブルートフォース対策）
+export async function deriveKeyFromPassword(password: string, phone: string): Promise<bigint> {
   const enc = new TextEncoder()
-  const data = enc.encode(password + ':' + phone)
+  // パスワードをWebCryptoにインポート
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(password),
+    'PBKDF2',
+    false,
+    ['deriveBits']
+  )
 
-  // 簡易的なハッシュ（実運用ではPBKDF2を使用）
-  let hash = 0n
-  for (let i = 0; i < data.length; i++) {
-    // FNV-1a風のハッシュ計算
-    hash = (hash ^ BigInt(data[i])) * 0x100000001b3n
-    hash = hash & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffn
-  }
+  // PBKDF2で256ビットの鍵素材を導出
+  const derived = await crypto.subtle.deriveBits(
+    {
+      name: 'PBKDF2',
+      // saltには電話番号を使用（ユーザーごとに異なるsalt）
+      salt: enc.encode('smsandtell:' + phone),
+      iterations: 200000,
+      hash: 'SHA-256',
+    },
+    keyMaterial,
+    256
+  )
 
-  // N未満かつ1以上になるよう調整
-  let key = hash % (N - 1n) + 1n
-  // ゼロにならないよう保証
-  if (key === 0n) key = 1n
+  // 導出したビット列をbigintに変換し、曲線の位数以内に収める
+  let key = bytesToBigInt(new Uint8Array(derived)) % (N - 1n) + 1n
   return key
 }
