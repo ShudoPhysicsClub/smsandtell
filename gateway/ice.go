@@ -82,7 +82,11 @@ func HandleICEOffer(w http.ResponseWriter, r *http.Request) {
 		CallID:     callID,
 		TTL:        1,
 	}
-	data, _ := json.Marshal(msg)
+	data, err := json.Marshal(msg)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "メッセージのシリアライズ失敗")
+		return
+	}
 	BroadcastToNodes(data)
 
 	fmt.Printf("[ICE] offerブロードキャスト: from=%s to=%s callID=%s\n", req.From, req.To, callID)

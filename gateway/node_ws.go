@@ -81,8 +81,12 @@ func HandleNodeWS(w http.ResponseWriter, r *http.Request) {
 			Type:  "node_list",
 			Nodes: existingNodes,
 		}
-		data, _ := json.Marshal(listMsg)
-		nc.send <- data
+		data, err := json.Marshal(listMsg)
+		if err == nil {
+			nc.send <- data
+		} else {
+			fmt.Printf("[ノードWS] ノードリストのシリアライズ失敗: %v\n", err)
+		}
 	}
 
 	// 既存の全ノードに新ノードの参加を通知
@@ -90,10 +94,14 @@ func HandleNodeWS(w http.ResponseWriter, r *http.Request) {
 		Type:  "node_list",
 		Nodes: []string{addr},
 	}
-	newNodeData, _ := json.Marshal(newNodeMsg)
+	newNodeData, err := json.Marshal(newNodeMsg)
+	if err != nil {
+		fmt.Printf("[ノードWS] 新ノード通知のシリアライズ失敗: %v\n", err)
+		newNodeData = nil
+	}
 	nodesMu.RLock()
 	for a, existing := range nodes {
-		if a != addr {
+		if a != addr && newNodeData != nil {
 			select {
 			case existing.send <- newNodeData:
 			default:

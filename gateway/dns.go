@@ -5,7 +5,6 @@ package gateway
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -76,7 +75,7 @@ func routeSMSToRemote(from, to, body, networkPrefix string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return errors.New(fmt.Sprintf("リモートゲートウェイエラー: ステータス=%d", resp.StatusCode))
+		return fmt.Errorf("リモートゲートウェイエラー: ステータス=%d", resp.StatusCode)
 	}
 
 	fmt.Printf("[DNS] リモート転送成功: gateway=%s from=%s to=%s\n", gw.Address, from, to)

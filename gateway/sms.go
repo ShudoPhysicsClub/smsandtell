@@ -87,7 +87,11 @@ func HandleSMSSend(w http.ResponseWriter, r *http.Request) {
 			Body: req.Body,
 			TTL:  1,
 		}
-		data, _ := json.Marshal(msg)
+		data, err := json.Marshal(msg)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "メッセージのシリアライズ失敗")
+			return
+		}
 		BroadcastToNodes(data)
 		fmt.Printf("[SMS] ブロードキャスト: from=%s to=%s\n", req.From, req.To)
 		status = "delivered"

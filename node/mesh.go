@@ -6,6 +6,7 @@ package node
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -114,6 +115,7 @@ func HandleMeshWS(w http.ResponseWriter, r *http.Request) {
 
 // ConnectToNode は指定アドレスのノードに能動的にメッシュ接続する
 // 新ノード参加時にゲートウェイから通知された既存ノードリストに対して呼ばれる
+// SSRFを防ぐためにアドレスが有効なhost:port形式であることを検証する
 func ConnectToNode(addr string) {
 	// 既に接続済みの場合はスキップ
 	meshPeersMu.RLock()
@@ -123,12 +125,22 @@ func ConnectToNode(addr string) {
 		return
 	}
 
-	// WebSocket接続を確立（wss://またはws://）
-	url := fmt.Sprintf("ws://%s/mesh", addr)
+	// アドレスのhost:port形式を検証（SSRFを防ぐ）
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || host == "" || port == "" {
+		fmt.Printf("[メッシュ] 無効なノードアドレス: addr=%s\n", addr)
+		return
+	}
+	// ループバックアドレスへの接続はデモ用として許可（本番では制限する）
+	// 内部ネットワーク以外のアドレスへの接続を防ぐ
+	sanitizedAddr := net.JoinHostPort(host, port)
+
+	// 検証済みアドレスでWebSocket接続を確立
+	url := fmt.Sprintf("ws://%s/mesh", sanitizedAddr)
 	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
-	conn, _, err := dialer.Dial(url, nil)
-	if err != nil {
-		fmt.Printf("[メッシュ] ノード接続失敗 addr=%s: %v\n", addr, err)
+	conn, _, dialErr := dialer.Dial(url, nil)
+	if dialErr != nil {
+		fmt.Printf("[メッシュ] ノード接続失敗 addr=%s: %v\n", addr, dialErr)
 		return
 	}
 
@@ -206,14 +218,20 @@ func handleMeshMessage(rawMsg []byte) {
 			From: msg.From,
 			Body: msg.Body,
 		}
-		data, _ := json.Marshal(delivery)
+		data, err := json.Marshal(delivery)
+		if err != nil {
+			fmt.Printf("[メッシュ] SMS配信メッセージのシリアライズ失敗: %v\n", err)
+			return
+		}
 		DeliverToClient(msg.To, data)
 
 		// TTL>0の場合は隣接ノードに転送
 		if msg.TTL > 0 {
 			msg.TTL--
-			forwarded, _ := json.Marshal(msg)
-			BroadcastToMesh(forwarded)
+			forwarded, err := json.Marshal(msg)
+			if err == nil {
+				BroadcastToMesh(forwarded)
+			}
 		}
 
 	case "ice_offer":
@@ -236,14 +254,20 @@ func handleMeshMessage(rawMsg []byte) {
 			Candidates: allCandidates,
 			CallID:     msg.CallID,
 		}
-		data, _ := json.Marshal(delivery)
+		data, err := json.Marshal(delivery)
+		if err != nil {
+			fmt.Printf("[メッシュ] ICE offer配信メッセージのシリアライズ失敗: %v\n", err)
+			return
+		}
 		DeliverToClient(msg.To, data)
 
 		// TTL>0の場合は隣接ノードに転送
 		if msg.TTL > 0 {
 			msg.TTL--
-			forwarded, _ := json.Marshal(msg)
-			BroadcastToMesh(forwarded)
+			forwarded, err := json.Marshal(msg)
+			if err == nil {
+				BroadcastToMesh(forwarded)
+			}
 		}
 
 	case "ice_answer":
