@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -68,7 +69,7 @@ func routeSMSToRemote(from, to, body, networkPrefix string) error {
 
 	// HTTPクライアントにタイムアウトを設定
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Post(targetURL, "application/json", strings.NewReader(string(data)))
+	resp, err := client.Post(targetURL, "application/json", bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("リモートゲートウェイへの送信失敗: %w", err)
 	}

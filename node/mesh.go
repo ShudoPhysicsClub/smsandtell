@@ -228,8 +228,10 @@ func handleMeshMessage(rawMsg []byte) {
 		// TTL>0の場合は隣接ノードに転送
 		if msg.TTL > 0 {
 			msg.TTL--
-			forwarded, err := json.Marshal(msg)
-			if err == nil {
+			forwarded, fwdErr := json.Marshal(msg)
+			if fwdErr != nil {
+				fmt.Printf("[メッシュ] SMS転送メッセージのシリアライズ失敗: %v\n", fwdErr)
+			} else {
 				BroadcastToMesh(forwarded)
 			}
 		}
@@ -264,8 +266,10 @@ func handleMeshMessage(rawMsg []byte) {
 		// TTL>0の場合は隣接ノードに転送
 		if msg.TTL > 0 {
 			msg.TTL--
-			forwarded, err := json.Marshal(msg)
-			if err == nil {
+			forwarded, fwdErr := json.Marshal(msg)
+			if fwdErr != nil {
+				fmt.Printf("[メッシュ] ICE offer転送メッセージのシリアライズ失敗: %v\n", fwdErr)
+			} else {
 				BroadcastToMesh(forwarded)
 			}
 		}

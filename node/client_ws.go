@@ -103,9 +103,9 @@ func HandleClientWS(w http.ResponseWriter, r *http.Request) {
 
 	// クライアントを登録
 	clientsMu.Lock()
-	// 既存の接続がある場合は切断
+	// 既存の接続がある場合はWebSocketを閉じてから登録
 	if old, exists := clients[reg.Phone]; exists {
-		close(old.send)
+		old.conn.Close()
 	}
 	clients[reg.Phone] = cc
 	clientsMu.Unlock()
