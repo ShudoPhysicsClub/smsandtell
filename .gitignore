@@ -1,0 +1,8 @@
+# Go compiled binaries
+/node/node
+/window/window
+/db/db
+
+# Node.js
+node_modules/
+client/node_modules/
