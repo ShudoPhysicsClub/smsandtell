@@ -2162,10 +2162,14 @@ export function buildUI(): void {
   };
 
   btnLookupConnect.onclick = async () => {
+    if (btnLookupConnect.disabled) return;
+    btnLookupConnect.disabled = true;
     try {
       await doLogin();
     } catch (err) {
       setErrorStatus(err);
+    } finally {
+      btnLookupConnect.disabled = false;
     }
   };
 

@@ -531,14 +531,15 @@ func handleMeshWS(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			continue
 		}
+		var relayErr error
 		target.mu.Lock()
 		authed := target.authed
 		if authed {
-			err = target.conn.WriteJSON(map[string]any{"action": msg.Type, "data": msg.Data})
+			relayErr = target.conn.WriteJSON(map[string]any{"action": msg.Type, "data": msg.Data})
 		}
 		target.mu.Unlock()
-		if err != nil {
-			log.Printf("mesh relay failed to %s: %v", to, err)
+		if relayErr != nil {
+			log.Printf("mesh relay failed to %s: %v", to, relayErr)
 		}
 	}
 }

@@ -478,6 +478,12 @@ func connectToNode(addr string) {
 
 	node := &NodeConn{conn: conn}
 	nodesMu.Lock()
+	// ダイヤル中に別のgoroutineが同一アドレスを先に登録していた場合は重複接続を閉じる
+	if _, exists := nodes[addr]; exists {
+		nodesMu.Unlock()
+		conn.Close()
+		return
+	}
 	nodes[addr] = node
 	nodesMu.Unlock()
 	log.Printf("connected to node: %s", addr)
@@ -487,7 +493,10 @@ func connectToNode(addr string) {
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
 				nodesMu.Lock()
-				delete(nodes, addr)
+				// 別の接続が同じアドレスで登録されていれば削除しない
+				if cur, ok := nodes[addr]; ok && cur == node {
+					delete(nodes, addr)
+				}
 				nodesMu.Unlock()
 				log.Printf("node disconnected: %s", addr)
 				return
