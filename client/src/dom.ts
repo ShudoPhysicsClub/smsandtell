@@ -1,11 +1,13 @@
 export function styleInputBase(el: HTMLInputElement | HTMLTextAreaElement): void {
   el.style.width = '100%';
   el.style.boxSizing = 'border-box';
-  el.style.border = '1px solid #e7e4d9';
-  el.style.borderRadius = '10px';
+  el.style.border = '1px solid #e2e6f3';
+  el.style.borderRadius = '12px';
   el.style.padding = '10px 12px';
-  el.style.background = '#ffffff';
+  el.style.background = '#f9fafb';
   el.style.color = '#1f2230';
+  el.style.outline = 'none';
+  el.style.transition = 'border-color 0.15s';
 }
 
 export function createRow(labelText: string, input: HTMLElement): HTMLDivElement {
@@ -42,8 +44,8 @@ export function createButton(id: string, text: string): HTMLButtonElement {
   button.style.marginBottom = '8px';
   button.style.padding = '10px 14px';
   button.style.border = 'none';
-  button.style.borderRadius = '18px';
-  button.style.background = '#219bce';
+  button.style.borderRadius = '12px';
+  button.style.background = '#6c63ff';
   button.style.color = '#ffffff';
   button.style.cursor = 'pointer';
   button.style.fontWeight = '700';

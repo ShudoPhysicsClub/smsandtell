@@ -777,13 +777,13 @@ function generateAndShowMnemonic(
     words.forEach((word, i) => {
       const cell = document.createElement('div');
       cell.style.cssText =
-        'display:flex;align-items:center;gap:4px;padding:4px 6px;background:#fff;border-radius:6px;border:1px solid #dde3f0;font-size:13px';
+        'display:flex;align-items:center;gap:4px;padding:5px 8px;background:rgba(255,255,255,0.08);border-radius:8px;border:1px solid rgba(255,255,255,0.12);font-size:13px';
       const num = document.createElement('span');
       num.textContent = `${i + 1}.`;
-      num.style.cssText = 'min-width:20px;font-size:11px;color:#aaa;text-align:right';
+      num.style.cssText = 'min-width:20px;font-size:11px;color:rgba(255,255,255,0.4);text-align:right';
       const wordSpan = document.createElement('span');
       wordSpan.textContent = word;
-      wordSpan.style.cssText = 'font-family:monospace;font-weight:600;color:#1a2340';
+      wordSpan.style.cssText = 'font-family:monospace;font-weight:600;color:#e8e6ff';
       cell.appendChild(num);
       cell.appendChild(wordSpan);
       grid.appendChild(cell);
@@ -815,7 +815,7 @@ export function buildUI(): void {
   document.documentElement.style.height = '100%';
   document.body.style.height = '100%';
   document.body.style.margin = '0';
-  document.body.style.background = '#f2f2f7';
+  document.body.style.background = '#13111c';
   document.body.style.overflow = 'hidden';
 
   const container = document.createElement('div');
@@ -838,13 +838,13 @@ export function buildUI(): void {
   statusNode = document.createElement('div');
   statusNode.id = 'status';
   statusNode.textContent = 'ready';
-  statusNode.style.padding = '10px 12px';
+  statusNode.style.padding = '8px 14px';
   statusNode.style.marginBottom = '12px';
-  statusNode.style.background = '#ffffff';
-  statusNode.style.border = '1px solid #e4e0d2';
+  statusNode.style.background = 'rgba(108,99,255,0.1)';
+  statusNode.style.border = '1px solid rgba(108,99,255,0.2)';
   statusNode.style.borderRadius = '12px';
-  statusNode.style.color = '#3b3f53';
-  statusNode.style.fontSize = '13px';
+  statusNode.style.color = 'rgba(200,196,255,0.9)';
+  statusNode.style.fontSize = '12px';
 
   container.appendChild(h1);
   refreshAuthState();
@@ -930,19 +930,23 @@ export function buildUI(): void {
   const makeCard = (title: string): HTMLDivElement => {
     const outerWrap = document.createElement('div');
     outerWrap.style.cssText =
-      'width:100%;max-width:525px;min-height:670px;position:relative;' +
-      'background:url(https://raw.githubusercontent.com/khadkamhn/day-01-login-form/master/img/bg.jpg) no-repeat center/cover;' +
-      'box-shadow:0 12px 15px 0 rgba(0,0,0,.24),0 17px 50px 0 rgba(0,0,0,.19)';
+      'width:100%;max-width:460px;position:relative;';
     const card = document.createElement('div');
     card.style.cssText =
-      'width:100%;min-height:670px;padding:90px 70px 50px 70px;box-sizing:border-box;background:rgba(40,57,101,.9)';
+      'width:100%;padding:52px 48px 44px 48px;box-sizing:border-box;' +
+      'background:rgba(255,255,255,0.06);' +
+      'backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);' +
+      'border:1px solid rgba(255,255,255,0.1);' +
+      'border-radius:24px;' +
+      'box-shadow:0 24px 64px rgba(0,0,0,0.5)';
     const h2 = document.createElement('h2');
     h2.textContent = title;
     h2.style.textAlign = 'center';
-    h2.style.marginBottom = '1.5rem';
-    h2.style.fontSize = '22px';
-    h2.style.fontWeight = '600';
+    h2.style.marginBottom = '2rem';
+    h2.style.fontSize = '24px';
+    h2.style.fontWeight = '700';
     h2.style.color = '#fff';
+    h2.style.letterSpacing = '-0.3px';
     card.appendChild(h2);
     outerWrap.appendChild(card);
     (card as Record<string, unknown>)['__outerWrap'] = outerWrap;
@@ -979,17 +983,18 @@ export function buildUI(): void {
   const makePrimaryBtn = (id: string, label: string): HTMLButtonElement => {
     const btn = createButton(id, label);
     btn.style.width = '100%';
-    btn.style.padding = '15px 20px';
-    btn.style.background = '#1161ee';
+    btn.style.padding = '14px 20px';
+    btn.style.background = 'linear-gradient(135deg, #6c63ff 0%, #4f8ef7 100%)';
     btn.style.color = '#ffffff';
     btn.style.border = 'none';
-    btn.style.borderRadius = '25px';
+    btn.style.borderRadius = '14px';
     btn.style.fontSize = '15px';
     btn.style.fontWeight = '700';
     btn.style.cursor = 'pointer';
     btn.style.marginBottom = '0';
     btn.style.marginRight = '0';
-    btn.style.textTransform = 'uppercase';
+    btn.style.letterSpacing = '0.3px';
+    btn.style.boxShadow = '0 4px 18px rgba(108,99,255,0.4)';
     return btn;
   };
 
@@ -1012,7 +1017,7 @@ export function buildUI(): void {
 
   // --- ログイン画面 ---
   const loginScreen = document.createElement('div');
-  loginScreen.style.cssText = 'width:100%;background:#c8c8c8;display:flex;justify-content:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
+  loginScreen.style.cssText = 'width:100%;background:linear-gradient(135deg,#13111c 0%,#1d1b31 50%,#111827 100%);display:flex;justify-content:center;align-items:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
   const loginCard = makeCard('ログイン');
 
   const numberInput = createInput('number', '番号 (例: 02-xxxxxxxx)', localStorage.getItem(LS_PHONE_NUMBER) ?? localStorage.getItem(LS_NUMBER) ?? '');
@@ -1127,7 +1132,7 @@ export function buildUI(): void {
 
   // --- 新規登録画面 ---
   const signupScreen = document.createElement('div');
-  signupScreen.style.cssText = 'width:100%;background:#c8c8c8;display:flex;justify-content:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
+  signupScreen.style.cssText = 'width:100%;background:linear-gradient(135deg,#13111c 0%,#1d1b31 50%,#111827 100%);display:flex;justify-content:center;align-items:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
   const signupCard = makeCard('新規登録');
 
   const signupRouteInput = createInput('signupRoute', 'ルーティング番号（2桁、例: 02）');
@@ -1157,7 +1162,7 @@ export function buildUI(): void {
   // ニーモニック表示グリッド
   const signupMnemonicGrid = document.createElement('div');
   signupMnemonicGrid.style.cssText =
-    'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 0.6rem 0;background:rgba(255,255,255,.1);border-radius:10px;padding:10px';
+    'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 0.6rem 0;background:rgba(255,255,255,0.05);border-radius:14px;padding:12px;border:1px solid rgba(255,255,255,0.08)';
   const signupMnemonicStatus = document.createElement('p');
   signupMnemonicStatus.textContent = '生成中…';
   signupMnemonicStatus.style.cssText = 'font-size:12px;color:rgba(255,255,255,.6);margin:0 0 0.5rem 0;text-align:center';
@@ -1227,7 +1232,7 @@ export function buildUI(): void {
 
   // --- 再設定画面 ---
   const resetScreen = document.createElement('div');
-  resetScreen.style.cssText = 'width:100%;background:#c8c8c8;display:flex;justify-content:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
+  resetScreen.style.cssText = 'width:100%;background:linear-gradient(135deg,#13111c 0%,#1d1b31 50%,#111827 100%);display:flex;justify-content:center;align-items:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
   const resetCard = makeCard('秘密鍵の再設定');
 
   const resetRouteInput = createInput('resetRoute', 'ルーティング番号（2桁、例: 02）');
@@ -1256,7 +1261,7 @@ export function buildUI(): void {
 
   const resetMnemonicGrid = document.createElement('div');
   resetMnemonicGrid.style.cssText =
-    'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 0.6rem 0;background:rgba(255,255,255,.1);border-radius:10px;padding:10px';
+    'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 0.6rem 0;background:rgba(255,255,255,0.05);border-radius:14px;padding:12px;border:1px solid rgba(255,255,255,0.08)';
   const resetMnemonicStatus = document.createElement('p');
   resetMnemonicStatus.textContent = '生成中…';
   resetMnemonicStatus.style.cssText = 'font-size:12px;color:rgba(255,255,255,.6);margin:0 0 0.5rem 0;text-align:center';
@@ -1354,7 +1359,8 @@ export function buildUI(): void {
 
   const threadsPane = document.createElement('div');
   threadsPane.style.background = '#ffffff';
-  threadsPane.style.border = '1px solid #e3e6ef';
+  threadsPane.style.border = 'none';
+  threadsPane.style.borderRight = '1px solid #eef0f8';
   threadsPane.style.borderRadius = '0';
   threadsPane.style.padding = '0';
   threadsPane.style.minHeight = '0';
@@ -1363,8 +1369,8 @@ export function buildUI(): void {
   threadsPane.style.flexDirection = 'column';
 
   const conversationPane = document.createElement('div');
-  conversationPane.style.background = '#ffffff';
-  conversationPane.style.border = '1px solid #e3e6ef';
+  conversationPane.style.background = '#f5f7ff';
+  conversationPane.style.border = 'none';
   conversationPane.style.borderRadius = '0';
   conversationPane.style.padding = '0';
   conversationPane.style.minHeight = '0';
@@ -1428,8 +1434,8 @@ export function buildUI(): void {
   chatHeader.style.display = 'grid';
   chatHeader.style.gap = '8px';
   chatHeader.style.marginBottom = '0';
-  chatHeader.style.padding = '8px 10px';
-  chatHeader.style.borderBottom = '1px solid #e3e6ef';
+  chatHeader.style.padding = '12px 14px';
+  chatHeader.style.borderBottom = '1px solid #eef0f8';
 
   const threadHeaderRow = document.createElement('div');
   threadHeaderRow.style.display = 'flex';
@@ -1439,23 +1445,24 @@ export function buildUI(): void {
 
   const threadHeaderTitle = document.createElement('div');
   threadHeaderTitle.textContent = 'メッセージ';
-  threadHeaderTitle.style.fontSize = '13px';
+  threadHeaderTitle.style.fontSize = '14px';
   threadHeaderTitle.style.fontWeight = '700';
-  threadHeaderTitle.style.color = '#2b3550';
+  threadHeaderTitle.style.color = '#1a1a2e';
 
   const btnCreateThread = document.createElement('button');
   btnCreateThread.type = 'button';
   btnCreateThread.textContent = '+';
   btnCreateThread.title = '新規作成';
-  btnCreateThread.style.width = '28px';
-  btnCreateThread.style.height = '28px';
+  btnCreateThread.style.width = '30px';
+  btnCreateThread.style.height = '30px';
   btnCreateThread.style.borderRadius = '999px';
-  btnCreateThread.style.border = '1px solid #d6dceb';
-  btnCreateThread.style.background = '#ffffff';
-  btnCreateThread.style.color = '#2b3550';
+  btnCreateThread.style.border = 'none';
+  btnCreateThread.style.background = 'linear-gradient(135deg,#6c63ff,#4f8ef7)';
+  btnCreateThread.style.color = '#ffffff';
   btnCreateThread.style.fontSize = '18px';
   btnCreateThread.style.lineHeight = '1';
   btnCreateThread.style.cursor = 'pointer';
+  btnCreateThread.style.boxShadow = '0 2px 8px rgba(108,99,255,0.35)';
 
   threadHeaderRow.appendChild(threadHeaderTitle);
   threadHeaderRow.appendChild(btnCreateThread);
@@ -1472,42 +1479,44 @@ export function buildUI(): void {
   chatTopBar.style.display = 'flex';
   chatTopBar.style.alignItems = 'center';
   chatTopBar.style.gap = '10px';
-  chatTopBar.style.padding = '4px 0';
+  chatTopBar.style.padding = '10px 14px';
   chatTopBar.style.background = '#ffffff';
   chatTopBar.style.border = 'none';
-  chatTopBar.style.borderBottom = '1px solid #e3e6ef';
+  chatTopBar.style.borderBottom = '1px solid #eef0f8';
   chatTopBar.style.borderRadius = '0';
   chatTopBar.style.marginBottom = '0';
 
   const avatar = document.createElement('div');
   avatar.textContent = '●';
-  avatar.style.width = '26px';
-  avatar.style.height = '26px';
+  avatar.style.width = '32px';
+  avatar.style.height = '32px';
   avatar.style.borderRadius = '999px';
   avatar.style.display = 'grid';
   avatar.style.placeItems = 'center';
-  avatar.style.background = '#d9e9ff';
-  avatar.style.color = '#0a84ff';
+  avatar.style.background = 'linear-gradient(135deg,#6c63ff,#4f8ef7)';
+  avatar.style.color = '#ffffff';
   avatar.style.fontSize = '10px';
+  avatar.style.flexShrink = '0';
 
   const chatPeerLabel = document.createElement('div');
-  chatPeerLabel.style.fontSize = '13px';
+  chatPeerLabel.style.fontSize = '14px';
   chatPeerLabel.style.fontWeight = '700';
-  chatPeerLabel.style.color = '#2b3550';
+  chatPeerLabel.style.color = '#1a1a2e';
   chatPeerLabel.textContent = '宛先未設定';
 
   const peerNameInput = createInput('peerName', '番号の表示名');
   peerNameInput.style.maxWidth = '220px';
   peerNameInput.style.marginLeft = 'auto';
 
-  const btnHeaderCall = createButton('btnHeaderCall', '通話');
+  const btnHeaderCall = createButton('btnHeaderCall', '📞');
   btnHeaderCall.style.marginRight = '0';
   btnHeaderCall.style.marginBottom = '0';
-  btnHeaderCall.style.borderRadius = '10px';
-  btnHeaderCall.style.padding = '6px 10px';
-  btnHeaderCall.style.background = '#0a84ff';
+  btnHeaderCall.style.borderRadius = '12px';
+  btnHeaderCall.style.padding = '6px 12px';
+  btnHeaderCall.style.background = 'linear-gradient(135deg,#6c63ff,#4f8ef7)';
   btnHeaderCall.style.color = '#ffffff';
   btnHeaderCall.style.border = 'none';
+  btnHeaderCall.style.boxShadow = '0 2px 8px rgba(108,99,255,0.3)';
 
   const btnMobileBack = createButton('btnMobileBack', '←');
   btnMobileBack.style.marginRight = '0';
@@ -1535,22 +1544,26 @@ export function buildUI(): void {
   composerWrap.style.gap = '8px';
   composerWrap.style.alignItems = 'end';
   composerWrap.style.marginTop = '0';
-  composerWrap.style.padding = '4px 0';
+  composerWrap.style.padding = '10px 14px';
   composerWrap.style.background = '#ffffff';
   composerWrap.style.border = 'none';
-  composerWrap.style.borderTop = '1px solid #e3e6ef';
+  composerWrap.style.borderTop = '1px solid #eef0f8';
   composerWrap.style.borderRadius = '0';
   composerWrap.style.position = 'sticky';
   composerWrap.style.bottom = '0';
 
-  const btnSendSMS = createButton('btnSendSMS', '送信');
+  const btnSendSMS = createButton('btnSendSMS', '↑');
   btnSendSMS.style.marginRight = '0';
   btnSendSMS.style.marginBottom = '0';
-  btnSendSMS.style.background = '#0a84ff';
+  btnSendSMS.style.background = 'linear-gradient(135deg,#6c63ff,#4f8ef7)';
   btnSendSMS.style.color = '#ffffff';
   btnSendSMS.style.border = 'none';
-  btnSendSMS.style.borderRadius = '14px';
-  btnSendSMS.style.padding = '8px 14px';
+  btnSendSMS.style.borderRadius = '999px';
+  btnSendSMS.style.width = '38px';
+  btnSendSMS.style.height = '38px';
+  btnSendSMS.style.padding = '0';
+  btnSendSMS.style.fontSize = '18px';
+  btnSendSMS.style.boxShadow = '0 2px 8px rgba(108,99,255,0.4)';
 
   const sendHistoryTitle = document.createElement('h3');
   sendHistoryTitle.textContent = '';
@@ -1572,10 +1585,10 @@ export function buildUI(): void {
   messageFeedNode.style.flexDirection = 'column';
   messageFeedNode.style.gap = '6px';
   messageFeedNode.style.overflowY = 'auto';
-  messageFeedNode.style.padding = '10px 0';
+  messageFeedNode.style.padding = '10px 14px';
   messageFeedNode.style.border = 'none';
   messageFeedNode.style.borderRadius = '0';
-  messageFeedNode.style.background = '#ffffff';
+  messageFeedNode.style.background = '#f5f7ff';
   messageFeedNode.style.minHeight = '0';
   messageFeedNode.style.flex = '1';
   conversationPane.appendChild(messageFeedNode);
@@ -1792,22 +1805,23 @@ export function buildUI(): void {
       row.type = 'button';
       row.style.textAlign = 'left';
       row.style.border = 'none';
-      row.style.borderBottom = '1px solid #e3e6ef';
+      row.style.borderBottom = '1px solid #f0f2fa';
+      row.style.borderLeft = peer === activeThreadNumber ? '3px solid #6c63ff' : '3px solid transparent';
       row.style.borderRadius = '0';
-      row.style.padding = '12px 8px';
-      row.style.background = peer === activeThreadNumber ? '#e9f3ff' : 'transparent';
+      row.style.padding = '13px 14px';
+      row.style.background = peer === activeThreadNumber ? '#f0eeff' : 'transparent';
       row.style.cursor = 'pointer';
 
       const head = document.createElement('div');
-      head.style.fontSize = '12px';
+      head.style.fontSize = '13px';
       head.style.fontWeight = '700';
-      head.style.color = '#2b3550';
+      head.style.color = '#1a1a2e';
       head.textContent = getDisplayName(peer);
 
       const preview = document.createElement('div');
       preview.style.marginTop = '3px';
       preview.style.fontSize = '11px';
-      preview.style.color = '#5e6880';
+      preview.style.color = '#7a82a0';
       preview.textContent = latest.body.slice(0, 36);
 
       row.appendChild(head);
@@ -1896,11 +1910,11 @@ export function buildUI(): void {
 
       const bubble = document.createElement('div');
       bubble.style.maxWidth = '78%';
-      bubble.style.padding = '8px 12px';
+      bubble.style.padding = '9px 14px';
       bubble.style.borderRadius = msg.direction === 'out' ? '18px 18px 6px 18px' : '18px 18px 18px 6px';
-      bubble.style.background = msg.direction === 'out' ? '#0a84ff' : '#ffffff';
+      bubble.style.background = msg.direction === 'out' ? 'linear-gradient(135deg,#6c63ff,#4f8ef7)' : '#ffffff';
       bubble.style.color = msg.direction === 'out' ? '#ffffff' : '#1f2940';
-      bubble.style.boxShadow = msg.direction === 'out' ? '0 2px 8px rgba(10, 132, 255, 0.25)' : '0 2px 8px rgba(0,0,0,0.08)';
+      bubble.style.boxShadow = msg.direction === 'out' ? '0 3px 12px rgba(108,99,255,0.35)' : '0 2px 8px rgba(0,0,0,0.07)';
 
       const bodyNode = document.createElement('div');
       bodyNode.style.fontSize = '14px';
@@ -2009,16 +2023,17 @@ export function buildUI(): void {
   disconnectXButton.style.position = 'fixed';
   disconnectXButton.style.top = '14px';
   disconnectXButton.style.right = '14px';
-  disconnectXButton.style.width = '34px';
-  disconnectXButton.style.height = '34px';
+  disconnectXButton.style.width = '36px';
+  disconnectXButton.style.height = '36px';
   disconnectXButton.style.border = 'none';
   disconnectXButton.style.borderRadius = '999px';
-  disconnectXButton.style.background = '#2b2f45';
-  disconnectXButton.style.color = '#ffffff';
+  disconnectXButton.style.background = 'rgba(108,99,255,0.15)';
+  disconnectXButton.style.color = '#6c63ff';
   disconnectXButton.style.cursor = 'pointer';
   disconnectXButton.style.fontSize = '20px';
   disconnectXButton.style.lineHeight = '1';
   disconnectXButton.style.display = 'none';
+  disconnectXButton.style.backdropFilter = 'blur(8px)';
   disconnectXButton.onclick = () => {
     closeNodeWS();
     currentChallenge = '';
