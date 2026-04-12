@@ -2093,7 +2093,11 @@ export function buildUI(): void {
   syncAuthUI();
   setActiveScreen('login');
 
+  let isLoggingIn = false;
   const doLogin = async (opts?: { silent?: boolean }): Promise<void> => {
+    if (isLoggingIn) throw new Error('ログイン処理中です。完了をお待ちください');
+    isLoggingIn = true;
+    try {
     currentNumber = numberInput.value.trim();
     const mnemonicValue = mnemonicLoginTextarea.value.trim();
     const privateKeyHex = mnemonicValue
@@ -2159,6 +2163,9 @@ export function buildUI(): void {
 
     if (!opts?.silent) setStatus(`ログイン成功: ${currentNumber}`);
     setActiveScreen('chat');
+    } finally {
+      isLoggingIn = false;
+    }
   };
 
   btnLookupConnect.onclick = async () => {
