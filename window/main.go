@@ -904,7 +904,10 @@ func handleICESignal(w http.ResponseWriter, r *http.Request, signalType string) 
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	if strings.TrimSpace(fmt.Sprintf("%v", body["from"])) == "" || strings.TrimSpace(fmt.Sprintf("%v", body["to"])) == "" {
+	// 型アサーションで文字列を取得する。null や非文字列型は空文字として扱われる。
+	from, _ := body["from"].(string)
+	to, _ := body["to"].(string)
+	if strings.TrimSpace(from) == "" || strings.TrimSpace(to) == "" {
 		http.Error(w, "missing from or to", http.StatusBadRequest)
 		return
 	}
