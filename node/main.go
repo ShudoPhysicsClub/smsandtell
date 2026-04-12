@@ -465,27 +465,15 @@ func handleMeshWS(w http.ResponseWriter, r *http.Request) {
 		clientsMu.RUnlock()
 
 		if msg.Type == "sms" {
-			// SMS: オンラインなら即配信、いなければDB保存
+			// SMS: windowがすでにDBに保存済みのため、ここではライブ配信のみ行う。
+			// DB保存は window/handleSMSSend が責任を持つ。
 			if ok {
 				target.mu.Lock()
 				authed := target.authed
-				var deliverErr error
 				if authed {
-					deliverErr = target.conn.WriteJSON(map[string]any{"action": "messages", "messages": []map[string]any{msg.Data}})
+					_ = target.conn.WriteJSON(map[string]any{"action": "messages", "messages": []map[string]any{msg.Data}})
 				}
 				target.mu.Unlock()
-				if authed && deliverErr == nil {
-					continue // 配信成功 → DB保存不要
-				}
-				log.Printf("sms deliver failed to %s, saving to db", to)
-			}
-			// オフライン or 配信失敗 → DB保存
-			raw, _ := json.Marshal(msg.Data)
-			var m Message
-			if err := json.Unmarshal(raw, &m); err == nil {
-				if err := saveMessage(&m); err != nil {
-					log.Printf("sms save failed for %s: %v", to, err)
-				}
 			}
 			continue
 		}

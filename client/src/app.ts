@@ -33,6 +33,9 @@ let nodeSocket: WebSocket | null = null;
 let currentNumber = '';
 let currentChallenge = '';
 let isAuthenticated = false;
+// currentPrivateKeyHex はセッション中のみメモリに保持する秘密鍵（永続化しない）。
+// persist=off の場合でも通話認証・SMS署名に使用できるようにする。
+let currentPrivateKeyHex = '';
 let pendingChallengeResolver: ((challenge: string) => void) | null = null;
 let pendingAuthResolver: (() => void) | null = null;
 
@@ -51,6 +54,8 @@ let callPeer: RTCPeerConnection | null = null;
 let localStream: MediaStream | null = null;
 let remoteAudioNode: HTMLAudioElement | null = null;
 let activeCallPeer = '';
+// remoteDescriptionが設定される前に届いたICE candidateをバッファする
+let pendingIceCandidates: RTCIceCandidateInit[] = [];
 let pendingCallAuth:
   | {
       peer: string;
@@ -264,6 +269,7 @@ function closeNodeWS(): void {
     nodeSocket = null;
   }
   isAuthenticated = false;
+  currentPrivateKeyHex = '';
   pendingChallengeResolver = null;
   pendingAuthResolver = null;
   pendingCallAuth = null;
@@ -619,6 +625,7 @@ function cleanupCall(): void {
     micAudioCtx = null;
   }
   activeCallPeer = '';
+  pendingIceCandidates = [];
   localMicMuted = false;
   if (syncCallRuntimeRef) {
     syncCallRuntimeRef();
@@ -629,7 +636,16 @@ async function ensurePeerForTarget(target: string): Promise<RTCPeerConnection> {
   if (!target) throw new Error('missing call target');
   if (callPeer && activeCallPeer === target) return callPeer;
   cleanupCall();
-  const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  const pc = new RTCPeerConnection({
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' },
+      { urls: 'stun:stun4.l.google.com:19302' },
+    ],
+    iceCandidatePoolSize: 10,
+  });
   const stream = await ensureLocalStream();
   for (const track of stream.getTracks()) {
     pc.addTrack(track, stream);
@@ -663,6 +679,11 @@ async function handleSignalAction(action: string, payload: unknown): Promise<voi
     setCallPhase('ringing', `${from} から着信`);
     const pc = await ensurePeerForTarget(from);
     await pc.setRemoteDescription(new RTCSessionDescription(offer));
+    // remoteDescriptionが設定されたのでバッファ済みcandidateを処理する
+    const queued = pendingIceCandidates.splice(0);
+    for (const c of queued) {
+      await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+    }
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     await sendICEAnswer(windowBase, { from: currentNumber, to: from, answer: pc.localDescription?.toJSON() ?? answer });
@@ -674,6 +695,11 @@ async function handleSignalAction(action: string, payload: unknown): Promise<voi
     const answer = body.answer as RTCSessionDescriptionInit | undefined;
     if (!from || !answer || !callPeer) return;
     await callPeer.setRemoteDescription(new RTCSessionDescription(answer));
+    // remoteDescriptionが設定されたのでバッファ済みcandidateを処理する
+    const queued = pendingIceCandidates.splice(0);
+    for (const c of queued) {
+      await callPeer.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+    }
     const publicKeyHex = await getPublicKeyByNumber(windowBase, from);
     const challenge = createChallengeHex();
     pendingCallAuth = { peer: from, challenge, publicKeyHex };
@@ -685,15 +711,23 @@ async function handleSignalAction(action: string, payload: unknown): Promise<voi
 
   if (action === 'ice_candidate') {
     const candidate = body.candidate as RTCIceCandidateInit | undefined;
-    if (!candidate || !callPeer) return;
-    await callPeer.addIceCandidate(new RTCIceCandidate(candidate));
+    if (!candidate) return;
+    // peerConnectionが未作成またはremoteDescriptionが未設定ならキューに追加
+    if (!callPeer || callPeer.remoteDescription === null) {
+      pendingIceCandidates.push(candidate);
+      return;
+    }
+    await callPeer.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
     return;
   }
 
   if (action === 'call_auth_challenge') {
     const challenge = String(body.challenge ?? '').trim();
     if (!from || !challenge) return;
-    const privateKeyHex = normalizePrivateKeyHex(localStorage.getItem(LS_PRIVATE_KEY) ?? '');
+    // セッション中の秘密鍵を優先。persist=offでlocalStorageにない場合でも動作する
+    const privateKeyHex =
+      currentPrivateKeyHex ||
+      normalizePrivateKeyHex(localStorage.getItem(LS_PRIVATE_KEY) ?? '');
     const sig = makeAuthSignatureHex(currentNumber, challenge, privateKeyHex);
     setCallPhase('verifying', `${from} に認証応答を送信`);
     await sendCallAuthResponse(windowBase, { from: currentNumber, to: from, challenge, sig });
@@ -2058,6 +2092,9 @@ export function buildUI(): void {
       throw new Error('number は必須');
     }
 
+    // セッション中のみメモリに保持（persist=offでも通話認証・SMS署名で使用）
+    currentPrivateKeyHex = privateKeyHex;
+
     localStorage.setItem(LS_PERSIST_SENSITIVE, persistSensitiveCheck.checked ? '1' : '0');
     if (persistSensitiveCheck.checked) {
       localStorage.setItem(LS_PRIVATE_KEY, privateKeyHex);
@@ -2241,7 +2278,10 @@ export function buildUI(): void {
       if (!to) throw new Error('to is required');
       if (!from) throw new Error('from is required');
       if (!body) throw new Error('message is required');
-      const privateKeyHex = normalizePrivateKeyHex((privateKeyInput.value || localStorage.getItem(LS_PRIVATE_KEY)) ?? '');
+      // セッション変数を優先。persist=offや入力欄クリア後でも署名できる
+      const privateKeyHex =
+        currentPrivateKeyHex ||
+        normalizePrivateKeyHex((privateKeyInput.value || localStorage.getItem(LS_PRIVATE_KEY)) ?? '');
       const sig = makeMessageSignatureHex(from, to, { body }, timestamp, privateKeyHex);
 
       const id = crypto.randomUUID();

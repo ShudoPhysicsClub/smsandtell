@@ -2,6 +2,7 @@ package main
 
 import (
 	crand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -270,6 +271,83 @@ func sendEmail(to, subject, body string) error {
 	return err
 }
 
+// --- CORS ---
+
+// corsMiddleware はすべてのHTTPレスポンスにCORSヘッダーを付与する。
+// ブラウザからのfetchリクエストがCORSポリシーでブロックされないようにする。
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+		} else {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Request-ID")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// --- メッセージ型・署名検証 ---
+
+// Message はSMSメッセージの構造体。node/main.go と同一定義。
+type Message struct {
+	Timestamp int64           `json:"timestamp"`
+	Message   json.RawMessage `json:"message"`
+	To        string          `json:"to"`
+	From      string          `json:"from"`
+	Sig       string          `json:"sig"`
+}
+
+func buildMessageSigningPayload(msg *Message) map[string]any {
+	return map[string]any{
+		"timestamp": msg.Timestamp,
+		"message":   json.RawMessage(msg.Message),
+		"to":        msg.To,
+		"from":      msg.From,
+	}
+}
+
+// verifyMessageSignature はSMSメッセージの署名をwindow側で検証する。
+// DBから送信者の公開鍵を取得してECDSA検証を行う。
+func verifyMessageSignature(msg *Message) error {
+	if msg.From == "" || msg.To == "" || len(msg.Message) == 0 || msg.Timestamp == 0 || msg.Sig == "" {
+		return fmt.Errorf("missing signed fields")
+	}
+	_, pubHex, err := getUserByNumber(msg.From)
+	if err != nil {
+		return fmt.Errorf("sender not found: %w", err)
+	}
+	pubBytes, err := hex.DecodeString(pubHex)
+	if err != nil || len(pubBytes) != 64 {
+		return fmt.Errorf("invalid public key encoding")
+	}
+	sigBytes, err := hex.DecodeString(msg.Sig)
+	if err != nil || len(sigBytes) != 96 {
+		return fmt.Errorf("invalid signature encoding")
+	}
+	payload := buildMessageSigningPayload(msg)
+	normalized, err := CanonicalJSON(payload)
+	if err != nil {
+		return err
+	}
+	var pub PublicKey
+	copy(pub[:], pubBytes)
+	var sig Signature
+	copy(sig[:], sigBytes)
+	if !Verify(pub, normalized, sig) {
+		return fmt.Errorf("signature verify failed")
+	}
+	return nil
+}
+
 // --- ノード管理 ---
 
 type NodeConn struct {
@@ -345,6 +423,25 @@ func lookupSeed(domain, number string) ([]string, error) {
 	return records["node"], nil
 }
 
+// normalizeMeshURL はDNSレコード等から取得したノードアドレスを
+// /mesh エンドポイントの wss:// URL に正規化する。
+// 既存のスキームやパスが含まれていても正しく処理する。
+func normalizeMeshURL(addr string) string {
+	addr = strings.TrimSpace(addr)
+	// スキームがあれば除去
+	for _, pfx := range []string{"wss://", "ws://", "https://", "http://"} {
+		if strings.HasPrefix(addr, pfx) {
+			addr = addr[len(pfx):]
+			break
+		}
+	}
+	// パスがあれば除去（ホスト:ポートだけ残す）
+	if i := strings.Index(addr, "/"); i >= 0 {
+		addr = addr[:i]
+	}
+	return "wss://" + addr + "/mesh"
+}
+
 // connectToNode はノードにWSS接続してnodesに登録する
 func connectToNode(addr string) {
 	nodesMu.Lock()
@@ -354,7 +451,8 @@ func connectToNode(addr string) {
 	}
 	nodesMu.Unlock()
 
-	conn, _, err := websocket.DefaultDialer.Dial("wss://"+addr+"/mesh", nil)
+	meshURL := normalizeMeshURL(addr)
+	conn, _, err := websocket.DefaultDialer.Dial(meshURL, nil)
 	if err != nil {
 		log.Printf("failed to connect to node %s: %v", addr, err)
 		return
@@ -645,48 +743,38 @@ func handleSMSSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	var msg Message
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-
-	// メッセージワード構築
-	message := map[string]interface{}{
-		"timestamp": body["timestamp"],
-		"message":   body["message"],
-		"to":        body["to"],
-		"from":      body["from"],
-		"sig":       body["sig"],
+	if msg.Timestamp == 0 {
+		msg.Timestamp = time.Now().UTC().Unix()
 	}
 
-	// ノード選択（最初のノードを使用）
-	nodesMu.RLock()
-	var nodeAddr string
-	for addr := range nodes {
-		nodeAddr = addr
-		break
-	}
-	nodesMu.RUnlock()
-
-	if nodeAddr == "" {
-		http.Error(w, "no nodes available", http.StatusServiceUnavailable)
+	// 署名検証（送信者が正規ユーザーであることを確認）
+	if err := verifyMessageSignature(&msg); err != nil {
+		log.Printf("sms signature verification failed from=%s: %v", msg.From, err)
+		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
 
-	// ノードに HTTP POST でメッセージ保存指示
-	msgJSON, _ := json.Marshal(message)
-	resp, err := http.Post(
-		"http://"+nodeAddr+"/store-message",
-		"application/json",
-		strings.NewReader(string(msgJSON)),
-	)
-	if err != nil {
-		log.Printf("failed to send message to node: %v", err)
+	// DBに直接保存（ノード経由ではなく window が直接保存することでHTTP/TLSの
+	// 不整合および ephemeral port 問題を回避する）
+	var storeOut map[string]string
+	if err := dbWSCall("messages.store", msg, &storeOut); err != nil {
+		log.Printf("sms store failed to=%s: %v", msg.To, err)
 		http.Error(w, "failed to store message", http.StatusInternalServerError)
 		return
 	}
-	defer resp.Body.Close()
+
+	// ライブ配信のためにメッシュ経由でブロードキャスト（ベストエフォート）
+	// ノード側はDB保存をせず、オンラインなら即配信するだけにする
+	broadcastMsg, _ := json.Marshal(map[string]any{
+		"type": "sms",
+		"data": msg,
+	})
+	broadcast(broadcastMsg)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -928,12 +1016,12 @@ func main() {
 
 	if certFile != "" && keyFile != "" {
 		log.Println("window listening on :" + port + " (TLS)")
-		if err := http.ListenAndServeTLS(":"+port, certFile, keyFile, mux); err != nil {
+		if err := http.ListenAndServeTLS(":"+port, certFile, keyFile, corsMiddleware(mux)); err != nil {
 			log.Fatal(err)
 		}
 	} else {
 		log.Println("window listening on :" + port)
-		if err := http.ListenAndServe(":"+port, mux); err != nil {
+		if err := http.ListenAndServe(":"+port, corsMiddleware(mux)); err != nil {
 			log.Fatal(err)
 		}
 	}
