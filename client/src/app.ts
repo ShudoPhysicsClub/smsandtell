@@ -903,7 +903,7 @@ export function buildUI(): void {
     activeScreenKey = targetKey;
     const keys: ScreenKey[] = ['login', 'signup', 'reset', 'chat'];
     for (const name of keys) {
-      screens[name].style.display = name === targetKey ? 'block' : 'none';
+      screens[name].style.display = name === targetKey ? (name !== 'chat' ? 'flex' : 'block') : 'none';
     }
     // サインアップ画面を開くときはステップ1に戻す
     if (targetKey === 'signup') {
@@ -928,21 +928,24 @@ export function buildUI(): void {
 
   // --- カード型ヘルパー ---
   const makeCard = (title: string): HTMLDivElement => {
+    const outerWrap = document.createElement('div');
+    outerWrap.style.cssText =
+      'width:100%;max-width:525px;min-height:670px;position:relative;' +
+      'background:url(https://raw.githubusercontent.com/khadkamhn/day-01-login-form/master/img/bg.jpg) no-repeat center/cover;' +
+      'box-shadow:0 12px 15px 0 rgba(0,0,0,.24),0 17px 50px 0 rgba(0,0,0,.19)';
     const card = document.createElement('div');
-    card.style.maxWidth = '400px';
-    card.style.margin = '40px auto';
-    card.style.padding = '2rem';
-    card.style.background = '#ffffff';
-    card.style.borderRadius = '12px';
-    card.style.boxShadow = '0 10px 30px rgba(0,0,0,0.1)';
+    card.style.cssText =
+      'width:100%;min-height:670px;padding:90px 70px 50px 70px;box-sizing:border-box;background:rgba(40,57,101,.9)';
     const h2 = document.createElement('h2');
     h2.textContent = title;
     h2.style.textAlign = 'center';
     h2.style.marginBottom = '1.5rem';
-    h2.style.fontSize = '20px';
+    h2.style.fontSize = '22px';
     h2.style.fontWeight = '600';
-    h2.style.color = '#333';
+    h2.style.color = '#fff';
     card.appendChild(h2);
+    outerWrap.appendChild(card);
+    (card as Record<string, unknown>)['__outerWrap'] = outerWrap;
     return card;
   };
 
@@ -953,20 +956,21 @@ export function buildUI(): void {
     lbl.textContent = label;
     lbl.style.display = 'block';
     lbl.style.marginBottom = '0.4rem';
-    lbl.style.fontWeight = '500';
-    lbl.style.fontSize = '14px';
-    lbl.style.color = '#555';
+    lbl.style.fontWeight = '600';
+    lbl.style.fontSize = '12px';
+    lbl.style.color = '#aaa';
+    lbl.style.textTransform = 'uppercase';
     input.style.width = '100%';
-    input.style.padding = '10px 14px';
-    input.style.border = '2px solid #e1e5e9';
-    input.style.borderRadius = '8px';
+    input.style.padding = '15px 20px';
+    input.style.border = 'none';
+    input.style.borderRadius = '25px';
     input.style.fontSize = '14px';
     input.style.boxSizing = 'border-box';
-    input.style.background = '#fff';
-    input.style.color = '#1f2230';
+    input.style.background = 'rgba(255,255,255,.1)';
+    input.style.color = '#fff';
     input.style.outline = 'none';
-    input.addEventListener('focus', () => { input.style.borderColor = '#0a84ff'; });
-    input.addEventListener('blur', () => { input.style.borderColor = '#e1e5e9'; });
+    input.addEventListener('focus', () => { input.style.background = 'rgba(255,255,255,.18)'; });
+    input.addEventListener('blur', () => { input.style.background = 'rgba(255,255,255,.1)'; });
     group.appendChild(lbl);
     group.appendChild(input);
     return group;
@@ -975,16 +979,17 @@ export function buildUI(): void {
   const makePrimaryBtn = (id: string, label: string): HTMLButtonElement => {
     const btn = createButton(id, label);
     btn.style.width = '100%';
-    btn.style.padding = '12px';
-    btn.style.background = '#0a84ff';
+    btn.style.padding = '15px 20px';
+    btn.style.background = '#1161ee';
     btn.style.color = '#ffffff';
     btn.style.border = 'none';
-    btn.style.borderRadius = '8px';
+    btn.style.borderRadius = '25px';
     btn.style.fontSize = '15px';
     btn.style.fontWeight = '700';
     btn.style.cursor = 'pointer';
     btn.style.marginBottom = '0';
     btn.style.marginRight = '0';
+    btn.style.textTransform = 'uppercase';
     return btn;
   };
 
@@ -998,7 +1003,7 @@ export function buildUI(): void {
     btn.style.marginTop = '1rem';
     btn.style.border = 'none';
     btn.style.background = 'transparent';
-    btn.style.color = '#0a84ff';
+    btn.style.color = 'rgba(255,255,255,.6)';
     btn.style.cursor = 'pointer';
     btn.style.fontSize = '13px';
     btn.onclick = onClick;
@@ -1007,7 +1012,7 @@ export function buildUI(): void {
 
   // --- ログイン画面 ---
   const loginScreen = document.createElement('div');
-  loginScreen.style.width = '100%';
+  loginScreen.style.cssText = 'width:100%;background:#c8c8c8;display:flex;justify-content:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
   const loginCard = makeCard('ログイン');
 
   const numberInput = createInput('number', '番号 (例: 02-xxxxxxxx)', localStorage.getItem(LS_PHONE_NUMBER) ?? localStorage.getItem(LS_NUMBER) ?? '');
@@ -1031,7 +1036,7 @@ export function buildUI(): void {
   btnTogglePrivateKey.textContent = '秘密鍵を表示';
   btnTogglePrivateKey.style.border = 'none';
   btnTogglePrivateKey.style.background = 'transparent';
-  btnTogglePrivateKey.style.color = '#0a84ff';
+  btnTogglePrivateKey.style.color = 'rgba(255,255,255,.7)';
   btnTogglePrivateKey.style.cursor = 'pointer';
   btnTogglePrivateKey.style.fontSize = '13px';
   btnTogglePrivateKey.style.padding = '0';
@@ -1055,7 +1060,7 @@ export function buildUI(): void {
   persistSensitiveLabel.style.alignItems = 'center';
   persistSensitiveLabel.style.gap = '6px';
   persistSensitiveLabel.style.fontSize = '12px';
-  persistSensitiveLabel.style.color = '#666';
+  persistSensitiveLabel.style.color = 'rgba(255,255,255,.7)';
   const persistSensitiveCheck = document.createElement('input');
   persistSensitiveCheck.type = 'checkbox';
   persistSensitiveCheck.checked = (localStorage.getItem(LS_PERSIST_SENSITIVE) ?? '1') !== '0';
@@ -1072,18 +1077,18 @@ export function buildUI(): void {
   const mnemonicRestoreToggle = document.createElement('button');
   mnemonicRestoreToggle.type = 'button';
   mnemonicRestoreToggle.textContent = '▶ ニーモニックから秘密鍵を復元する';
-  mnemonicRestoreToggle.style.cssText = 'border:none;background:transparent;color:#0a84ff;cursor:pointer;font-size:13px;padding:0;margin-bottom:0.5rem;text-align:left;width:100%';
+  mnemonicRestoreToggle.style.cssText = 'border:none;background:transparent;color:rgba(255,255,255,.7);cursor:pointer;font-size:13px;padding:0;margin-bottom:0.5rem;text-align:left;width:100%';
   const mnemonicRestoreSection = document.createElement('div');
   mnemonicRestoreSection.style.display = 'none';
   mnemonicRestoreSection.style.marginBottom = '1rem';
   const mnemonicRestoreTextarea = document.createElement('textarea');
   mnemonicRestoreTextarea.placeholder = '24語のニーモニックをスペース区切りで入力…';
   mnemonicRestoreTextarea.rows = 3;
-  mnemonicRestoreTextarea.style.cssText = 'width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:8px;padding:8px;font-size:13px;font-family:monospace;resize:vertical;margin-bottom:6px';
+  mnemonicRestoreTextarea.style.cssText = 'width:100%;box-sizing:border-box;border:1px solid rgba(255,255,255,.2);border-radius:8px;padding:8px;font-size:13px;font-family:monospace;resize:vertical;margin-bottom:6px;background:rgba(255,255,255,.1);color:#fff';
   const btnApplyMnemonic = document.createElement('button');
   btnApplyMnemonic.type = 'button';
   btnApplyMnemonic.textContent = 'ニーモニックを適用';
-  btnApplyMnemonic.style.cssText = 'border:none;background:#0a84ff;color:#fff;border-radius:8px;padding:6px 14px;cursor:pointer;font-size:13px';
+  btnApplyMnemonic.style.cssText = 'border:none;background:#1161ee;color:#fff;border-radius:25px;padding:8px 18px;cursor:pointer;font-size:13px';
   btnApplyMnemonic.onclick = async () => {
     try {
       const hex = await mnemonicToPrivateKeyHex(mnemonicRestoreTextarea.value);
@@ -1111,11 +1116,11 @@ export function buildUI(): void {
   loginCard.appendChild(btnLookupConnect);
   loginCard.appendChild(makeLinkBtn('新規登録はこちら', () => setActiveScreen('signup')));
   loginCard.appendChild(makeLinkBtn('パスワードを忘れた方', () => setActiveScreen('reset')));
-  loginScreen.appendChild(loginCard);
+  loginScreen.appendChild((loginCard as Record<string, unknown>)['__outerWrap'] as HTMLElement ?? loginCard);
 
   // --- 新規登録画面 ---
   const signupScreen = document.createElement('div');
-  signupScreen.style.width = '100%';
+  signupScreen.style.cssText = 'width:100%;background:#c8c8c8;display:flex;justify-content:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
   const signupCard = makeCard('新規登録');
 
   const signupRouteInput = createInput('signupRoute', 'ルーティング番号（2桁、例: 02）');
@@ -1138,17 +1143,17 @@ export function buildUI(): void {
     '新しい秘密鍵を自動生成しました。<br>' +
     '<strong>以下の24語のニーモニックを紙などに控えてください。</strong><br>' +
     'このニーモニックがないと秘密鍵を復元できません。';
-  signupStep2Note.style.cssText = 'margin:0 0 0.8rem 0;font-size:13px;color:#333;line-height:1.5';
+  signupStep2Note.style.cssText = 'margin:0 0 0.8rem 0;font-size:13px;color:#ddd;line-height:1.5';
   signupStep2.appendChild(signupStep2Note);
   signupStep2.appendChild(makeFormGroup('トークン', signupTokenInput));
 
   // ニーモニック表示グリッド
   const signupMnemonicGrid = document.createElement('div');
   signupMnemonicGrid.style.cssText =
-    'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 0.6rem 0;background:#f4f6fb;border-radius:10px;padding:10px';
+    'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 0.6rem 0;background:rgba(255,255,255,.1);border-radius:10px;padding:10px';
   const signupMnemonicStatus = document.createElement('p');
   signupMnemonicStatus.textContent = '生成中…';
-  signupMnemonicStatus.style.cssText = 'font-size:12px;color:#888;margin:0 0 0.5rem 0;text-align:center';
+  signupMnemonicStatus.style.cssText = 'font-size:12px;color:rgba(255,255,255,.6);margin:0 0 0.5rem 0;text-align:center';
   signupStep2.appendChild(signupMnemonicGrid);
   signupStep2.appendChild(signupMnemonicStatus);
 
@@ -1157,7 +1162,7 @@ export function buildUI(): void {
   btnSignupCopyMnemonic.type = 'button';
   btnSignupCopyMnemonic.textContent = 'ニーモニックをコピー';
   btnSignupCopyMnemonic.style.cssText =
-    'border:1px solid #0a84ff;background:transparent;color:#0a84ff;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px;margin-right:8px';
+    'border:1px solid rgba(255,255,255,.5);background:transparent;color:rgba(255,255,255,.8);border-radius:25px;padding:6px 14px;cursor:pointer;font-size:13px;margin-right:8px';
   btnSignupCopyMnemonic.onclick = () => {
     navigator.clipboard.writeText(signupMnemonicGrid.dataset['mnemonic'] ?? '').then(() => {
       btnSignupCopyMnemonic.textContent = 'コピー済み ✓';
@@ -1170,7 +1175,7 @@ export function buildUI(): void {
   btnSignupRegen.type = 'button';
   btnSignupRegen.textContent = '再生成';
   btnSignupRegen.style.cssText =
-    'border:1px solid #888;background:transparent;color:#555;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px';
+    'border:1px solid rgba(255,255,255,.3);background:transparent;color:rgba(255,255,255,.6);border-radius:25px;padding:6px 14px;cursor:pointer;font-size:13px';
   btnSignupRegen.onclick = () => {
     generateAndShowMnemonic(
       signupMnemonicGrid, signupMnemonicStatus,
@@ -1187,7 +1192,7 @@ export function buildUI(): void {
 
   // 確認チェックボックス
   const signupConfirmLabel = document.createElement('label');
-  signupConfirmLabel.style.cssText = 'display:flex;align-items:flex-start;gap:6px;font-size:13px;color:#333;margin-bottom:1rem;cursor:pointer';
+  signupConfirmLabel.style.cssText = 'display:flex;align-items:flex-start;gap:6px;font-size:13px;color:#ddd;margin-bottom:1rem;cursor:pointer';
   const signupConfirmCheck = document.createElement('input');
   signupConfirmCheck.type = 'checkbox';
   signupConfirmCheck.style.marginTop = '2px';
@@ -1211,11 +1216,11 @@ export function buildUI(): void {
   signupButtonWrap.appendChild(btnCreate);
   signupCard.appendChild(signupButtonWrap);
   signupCard.appendChild(makeLinkBtn('すでにアカウントをお持ちの方', () => setActiveScreen('login')));
-  signupScreen.appendChild(signupCard);
+  signupScreen.appendChild((signupCard as Record<string, unknown>)['__outerWrap'] as HTMLElement ?? signupCard);
 
   // --- 再設定画面 ---
   const resetScreen = document.createElement('div');
-  resetScreen.style.width = '100%';
+  resetScreen.style.cssText = 'width:100%;background:#c8c8c8;display:flex;justify-content:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
   const resetCard = makeCard('秘密鍵の再設定');
 
   const resetRouteInput = createInput('resetRoute', 'ルーティング番号（2桁、例: 02）');
@@ -1238,16 +1243,16 @@ export function buildUI(): void {
     '新しい秘密鍵を自動生成しました。<br>' +
     '<strong>以下の24語のニーモニックを紙などに控えてください。</strong><br>' +
     'このニーモニックがないと秘密鍵を復元できません。';
-  resetStep2Note.style.cssText = 'margin:0 0 0.8rem 0;font-size:13px;color:#333;line-height:1.5';
+  resetStep2Note.style.cssText = 'margin:0 0 0.8rem 0;font-size:13px;color:#ddd;line-height:1.5';
   resetStep2.appendChild(resetStep2Note);
   resetStep2.appendChild(makeFormGroup('トークン', resetTokenInput));
 
   const resetMnemonicGrid = document.createElement('div');
   resetMnemonicGrid.style.cssText =
-    'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 0.6rem 0;background:#f4f6fb;border-radius:10px;padding:10px';
+    'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 0.6rem 0;background:rgba(255,255,255,.1);border-radius:10px;padding:10px';
   const resetMnemonicStatus = document.createElement('p');
   resetMnemonicStatus.textContent = '生成中…';
-  resetMnemonicStatus.style.cssText = 'font-size:12px;color:#888;margin:0 0 0.5rem 0;text-align:center';
+  resetMnemonicStatus.style.cssText = 'font-size:12px;color:rgba(255,255,255,.6);margin:0 0 0.5rem 0;text-align:center';
   resetStep2.appendChild(resetMnemonicGrid);
   resetStep2.appendChild(resetMnemonicStatus);
 
@@ -1255,7 +1260,7 @@ export function buildUI(): void {
   btnResetCopyMnemonic.type = 'button';
   btnResetCopyMnemonic.textContent = 'ニーモニックをコピー';
   btnResetCopyMnemonic.style.cssText =
-    'border:1px solid #0a84ff;background:transparent;color:#0a84ff;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px;margin-right:8px';
+    'border:1px solid rgba(255,255,255,.5);background:transparent;color:rgba(255,255,255,.8);border-radius:25px;padding:6px 14px;cursor:pointer;font-size:13px;margin-right:8px';
   btnResetCopyMnemonic.onclick = () => {
     navigator.clipboard.writeText(resetMnemonicGrid.dataset['mnemonic'] ?? '').then(() => {
       btnResetCopyMnemonic.textContent = 'コピー済み ✓';
@@ -1267,7 +1272,7 @@ export function buildUI(): void {
   btnResetRegen.type = 'button';
   btnResetRegen.textContent = '再生成';
   btnResetRegen.style.cssText =
-    'border:1px solid #888;background:transparent;color:#555;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px';
+    'border:1px solid rgba(255,255,255,.3);background:transparent;color:rgba(255,255,255,.6);border-radius:25px;padding:6px 14px;cursor:pointer;font-size:13px';
   btnResetRegen.onclick = () => {
     generateAndShowMnemonic(
       resetMnemonicGrid, resetMnemonicStatus,
@@ -1283,7 +1288,7 @@ export function buildUI(): void {
   resetStep2.appendChild(resetBtnRow);
 
   const resetConfirmLabel = document.createElement('label');
-  resetConfirmLabel.style.cssText = 'display:flex;align-items:flex-start;gap:6px;font-size:13px;color:#333;margin-bottom:1rem;cursor:pointer';
+  resetConfirmLabel.style.cssText = 'display:flex;align-items:flex-start;gap:6px;font-size:13px;color:#ddd;margin-bottom:1rem;cursor:pointer';
   const resetConfirmCheck = document.createElement('input');
   resetConfirmCheck.type = 'checkbox';
   resetConfirmCheck.style.marginTop = '2px';
@@ -1307,7 +1312,7 @@ export function buildUI(): void {
   resetButtonWrap.appendChild(btnResetDo);
   resetCard.appendChild(resetButtonWrap);
   resetCard.appendChild(makeLinkBtn('ログインに戻る', () => setActiveScreen('login')));
-  resetScreen.appendChild(resetCard);
+  resetScreen.appendChild((resetCard as Record<string, unknown>)['__outerWrap'] as HTMLElement ?? resetCard);
 
   const chatScreen = createSection('会話画面');
   chatScreen.style.background = 'transparent';
