@@ -243,7 +243,7 @@ async function entropyToMnemonic(entropy: Uint8Array): Promise<string> {
   return words.join(' ');
 }
 
-/** ランダムな32バイト秘密鍵を生成し、対応するBIP39ニーモニック（24語）と16進文字列を返す */
+/** 32バイトのエントロピーからランダムな秘密鍵を生成し、対応するBIP39ニーモニック（24語）と16進文字列を返す */
 export async function generateMnemonic(): Promise<{ privateKeyHex: string; mnemonic: string }> {
   const entropy = new Uint8Array(32);
   crypto.getRandomValues(entropy);

@@ -1171,7 +1171,13 @@ export function buildUI(): void {
   btnSignupRegen.textContent = '再生成';
   btnSignupRegen.style.cssText =
     'border:1px solid #888;background:transparent;color:#555;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px';
-  btnSignupRegen.onclick = () => { generateAndShowMnemonic(signupMnemonicGrid, signupMnemonicStatus, (hex) => { signupGeneratedKeyHex = hex; }, signupConfirmCheck, btnCreate); };
+  btnSignupRegen.onclick = () => {
+    generateAndShowMnemonic(
+      signupMnemonicGrid, signupMnemonicStatus,
+      (hex) => { signupGeneratedKeyHex = hex; },
+      signupConfirmCheck, btnCreate,
+    );
+  };
 
   const signupBtnRow = document.createElement('div');
   signupBtnRow.style.cssText = 'display:flex;gap:8px;margin-bottom:0.8rem';
@@ -1262,7 +1268,13 @@ export function buildUI(): void {
   btnResetRegen.textContent = '再生成';
   btnResetRegen.style.cssText =
     'border:1px solid #888;background:transparent;color:#555;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px';
-  btnResetRegen.onclick = () => { generateAndShowMnemonic(resetMnemonicGrid, resetMnemonicStatus, (hex) => { resetGeneratedKeyHex = hex; }, resetConfirmCheck, btnResetDo); };
+  btnResetRegen.onclick = () => {
+    generateAndShowMnemonic(
+      resetMnemonicGrid, resetMnemonicStatus,
+      (hex) => { resetGeneratedKeyHex = hex; },
+      resetConfirmCheck, btnResetDo,
+    );
+  };
 
   const resetBtnRow = document.createElement('div');
   resetBtnRow.style.cssText = 'display:flex;gap:8px;margin-bottom:0.8rem';
