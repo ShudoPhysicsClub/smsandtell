@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -161,8 +162,8 @@ func dbWSCall(action string, payload any, out any) error {
 }
 
 func getPublicKeyByNumber(number string) (string, error) {
-	url := strings.TrimRight(windowAPIBase, "/") + "/pubkey/" + number
-	resp, err := http.Get(url)
+	reqURL := strings.TrimRight(windowAPIBase, "/") + "/pubkey/" + url.PathEscape(number)
+	resp, err := http.Get(reqURL)
 	if err != nil {
 		return "", err
 	}
@@ -385,6 +386,11 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userIDStr := strings.TrimSpace(string(userIDBytes))
+	if userIDStr == "" || len(userIDStr) > 128 {
+		// 空文字または過剰長の userID は拒否して接続を閉じる
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"invalid user id"}`))
+		return
+	}
 	client := &ClientConn{conn: conn, userID: userIDStr}
 
 	clientsMu.Lock()
@@ -395,7 +401,11 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 
 	defer func() {
 		clientsMu.Lock()
-		delete(clients, userIDStr)
+		// 再接続で同じ userID の新しい ClientConn がすでに登録されている場合は
+		// 古い goroutine の defer が新しい接続を誤って削除しないようにする。
+		if clients[userIDStr] == client {
+			delete(clients, userIDStr)
+		}
 		clientsMu.Unlock()
 		log.Printf("client disconnected: %s", userIDStr)
 	}()

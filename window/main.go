@@ -279,6 +279,10 @@ func sendEmail(to, subject, body string) error {
 	user := os.Getenv("SMTP_USER")
 	password := os.Getenv("SMTP_PASSWORD")
 
+	// SMTP ヘッダーインジェクション対策: to / subject の改行文字を除去する
+	to = strings.NewReplacer("\r", "", "\n", "").Replace(to)
+	subject = strings.NewReplacer("\r", "", "\n", "").Replace(subject)
+
 	auth := smtp.PlainAuth("", user, password, host)
 	msg := fmt.Sprintf("From: %s\nTo: %s\nSubject: %s\n\n%s", user, to, subject, body)
 	err := smtp.SendMail(host+":"+port, auth, user, []string{to}, []byte(msg))
