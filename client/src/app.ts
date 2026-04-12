@@ -295,8 +295,23 @@ function openNodeWS(number: string): Promise<void> {
     };
 
     ws.onclose = () => {
-      setStatus('node ws closed');
+      if (nodeSocket !== ws) {
+        // すでに別のソケットに置き換えられているか、closeNodeWSで処理済み
+        setStatus('node ws closed');
+        return;
+      }
       nodeSocket = null;
+      if (isAuthenticated) {
+        isAuthenticated = false;
+        pendingChallengeResolver = null;
+        pendingAuthResolver = null;
+        pendingCallAuth = null;
+        cleanupCall();
+        setCallPhase('idle');
+        refreshAuthState();
+        if (setActiveScreenRef) setActiveScreenRef('login');
+      }
+      setStatus('node ws closed');
     };
 
     ws.onmessage = (event) => {
@@ -846,6 +861,20 @@ export function buildUI(): void {
     for (const name of keys) {
       screens[name].style.display = name === targetKey ? 'block' : 'none';
     }
+    // サインアップ画面を開くときはステップ1に戻す
+    if (targetKey === 'signup') {
+      signupStep1.style.display = '';
+      signupStep2.style.display = 'none';
+      btnRegister.style.display = '';
+      btnCreate.style.display = 'none';
+    }
+    // 再設定画面を開くときはステップ1に戻す
+    if (targetKey === 'reset') {
+      resetStep1.style.display = '';
+      resetStep2.style.display = 'none';
+      btnResetReq.style.display = '';
+      btnResetDo.style.display = 'none';
+    }
     syncAuthUI();
   };
   setActiveScreenRef = setActiveScreen;
@@ -1009,6 +1038,9 @@ export function buildUI(): void {
   const signupRouteInput = createInput('signupRoute', 'ルーティング番号（2桁、例: 02）');
   const signupEmailInput = createInput('signupEmail', 'メールアドレス');
   const signupTokenInput = createInput('signupToken', 'メールのトークン');
+  const signupPrivateKeyInput = createInput('signupPrivateKey', '秘密鍵 (64桁の hex)');
+  signupPrivateKeyInput.type = 'password';
+  signupPrivateKeyInput.autocomplete = 'off';
 
   const signupStep1 = document.createElement('div');
   const signupStep2 = document.createElement('div');
@@ -1018,12 +1050,30 @@ export function buildUI(): void {
   signupStep1.appendChild(makeFormGroup('メールアドレス', signupEmailInput));
 
   const signupStep2Note = document.createElement('p');
-  signupStep2Note.textContent = '確認メールのトークンを入力して作成してください。';
+  signupStep2Note.textContent = '確認メールのトークンと、使用する秘密鍵を入力してアカウントを作成してください。';
   signupStep2Note.style.margin = '0 0 1rem 0';
   signupStep2Note.style.fontSize = '13px';
   signupStep2Note.style.color = '#555';
   signupStep2.appendChild(signupStep2Note);
   signupStep2.appendChild(makeFormGroup('トークン', signupTokenInput));
+  signupStep2.appendChild(makeFormGroup('秘密鍵 (hex)', signupPrivateKeyInput));
+
+  const btnSignupToggleKey = document.createElement('button');
+  btnSignupToggleKey.type = 'button';
+  btnSignupToggleKey.textContent = '秘密鍵を表示';
+  btnSignupToggleKey.style.border = 'none';
+  btnSignupToggleKey.style.background = 'transparent';
+  btnSignupToggleKey.style.color = '#0a84ff';
+  btnSignupToggleKey.style.cursor = 'pointer';
+  btnSignupToggleKey.style.fontSize = '13px';
+  btnSignupToggleKey.style.padding = '0';
+  btnSignupToggleKey.style.marginBottom = '1rem';
+  btnSignupToggleKey.onclick = () => {
+    const isHidden = signupPrivateKeyInput.type === 'password';
+    signupPrivateKeyInput.type = isHidden ? 'text' : 'password';
+    btnSignupToggleKey.textContent = isHidden ? '秘密鍵を隠す' : '秘密鍵を表示';
+  };
+  signupStep2.appendChild(btnSignupToggleKey);
 
   signupCard.appendChild(signupStep1);
   signupCard.appendChild(signupStep2);
@@ -1049,6 +1099,9 @@ export function buildUI(): void {
   const resetRouteInput = createInput('resetRoute', 'ルーティング番号（2桁、例: 02）');
   const resetEmailInput = createInput('resetEmail', 'メールアドレス');
   const resetTokenInput = createInput('resetToken', '再設定トークン');
+  const resetPrivateKeyInput = createInput('resetPrivateKey', '新しい秘密鍵 (64桁の hex)');
+  resetPrivateKeyInput.type = 'password';
+  resetPrivateKeyInput.autocomplete = 'off';
 
   const resetStep1 = document.createElement('div');
   const resetStep2 = document.createElement('div');
@@ -1058,12 +1111,30 @@ export function buildUI(): void {
   resetStep1.appendChild(makeFormGroup('メールアドレス', resetEmailInput));
 
   const resetStep2Note = document.createElement('p');
-  resetStep2Note.textContent = '再設定メールのトークンを入力してください。';
+  resetStep2Note.textContent = '再設定メールのトークンと、新しい秘密鍵を入力してください。';
   resetStep2Note.style.margin = '0 0 1rem 0';
   resetStep2Note.style.fontSize = '13px';
   resetStep2Note.style.color = '#555';
   resetStep2.appendChild(resetStep2Note);
   resetStep2.appendChild(makeFormGroup('トークン', resetTokenInput));
+  resetStep2.appendChild(makeFormGroup('新しい秘密鍵 (hex)', resetPrivateKeyInput));
+
+  const btnResetToggleKey = document.createElement('button');
+  btnResetToggleKey.type = 'button';
+  btnResetToggleKey.textContent = '秘密鍵を表示';
+  btnResetToggleKey.style.border = 'none';
+  btnResetToggleKey.style.background = 'transparent';
+  btnResetToggleKey.style.color = '#0a84ff';
+  btnResetToggleKey.style.cursor = 'pointer';
+  btnResetToggleKey.style.fontSize = '13px';
+  btnResetToggleKey.style.padding = '0';
+  btnResetToggleKey.style.marginBottom = '1rem';
+  btnResetToggleKey.onclick = () => {
+    const isHidden = resetPrivateKeyInput.type === 'password';
+    resetPrivateKeyInput.type = isHidden ? 'text' : 'password';
+    btnResetToggleKey.textContent = isHidden ? '秘密鍵を隠す' : '秘密鍵を表示';
+  };
+  resetStep2.appendChild(btnResetToggleKey);
 
   resetCard.appendChild(resetStep1);
   resetCard.appendChild(resetStep2);
@@ -1886,15 +1957,24 @@ export function buildUI(): void {
       const seed = await resolveSeed(route);
       windowBase = seed.windowBase;
       localStorage.setItem(LS_WINDOW_BASE, windowBase);
-      const privateKeyHex = normalizePrivateKeyHex(privateKeyInput.value);
+      const privateKeyHex = normalizePrivateKeyHex(signupPrivateKeyInput.value);
       const pubHex = derivePublicKeyHex(privateKeyHex);
-      localStorage.setItem(LS_PRIVATE_KEY, privateKeyHex);
-      localStorage.setItem(LS_PUBLIC_KEY, pubHex);
+      if (persistSensitiveCheck.checked) {
+        localStorage.setItem(LS_PRIVATE_KEY, privateKeyHex);
+        localStorage.setItem(LS_PUBLIC_KEY, pubHex);
+      } else {
+        localStorage.removeItem(LS_PRIVATE_KEY);
+        localStorage.removeItem(LS_PUBLIC_KEY);
+      }
       const number = await createAccount(windowBase, signupTokenInput.value.trim(), pubHex);
       setStatus(`account created: ${number}`);
       numberInput.value = number;
+      privateKeyInput.value = signupPrivateKeyInput.value;
       currentNumber = number;
-      localStorage.setItem(LS_NUMBER, number);
+      if (persistSensitiveCheck.checked) {
+        localStorage.setItem(LS_NUMBER, number);
+        localStorage.setItem(LS_PHONE_NUMBER, number);
+      }
       setActiveScreen('login');
     } catch (err) {
       setErrorStatus(err);
@@ -1925,15 +2005,24 @@ export function buildUI(): void {
       const seed = await resolveSeed(route);
       windowBase = seed.windowBase;
       localStorage.setItem(LS_WINDOW_BASE, windowBase);
-      const privateKeyHex = normalizePrivateKeyHex(privateKeyInput.value);
+      const privateKeyHex = normalizePrivateKeyHex(resetPrivateKeyInput.value);
       const pubHex = derivePublicKeyHex(privateKeyHex);
-      localStorage.setItem(LS_PRIVATE_KEY, privateKeyHex);
-      localStorage.setItem(LS_PUBLIC_KEY, pubHex);
+      if (persistSensitiveCheck.checked) {
+        localStorage.setItem(LS_PRIVATE_KEY, privateKeyHex);
+        localStorage.setItem(LS_PUBLIC_KEY, pubHex);
+      } else {
+        localStorage.removeItem(LS_PRIVATE_KEY);
+        localStorage.removeItem(LS_PUBLIC_KEY);
+      }
       const number = await resetDo(windowBase, resetTokenInput.value.trim(), pubHex);
       setStatus(`reset done: ${number}`);
       numberInput.value = number;
+      privateKeyInput.value = resetPrivateKeyInput.value;
       currentNumber = number;
-      localStorage.setItem(LS_NUMBER, number);
+      if (persistSensitiveCheck.checked) {
+        localStorage.setItem(LS_NUMBER, number);
+        localStorage.setItem(LS_PHONE_NUMBER, number);
+      }
       setActiveScreen('login');
     } catch (err) {
       setErrorStatus(err);
