@@ -424,7 +424,12 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 
 		switch action {
 		case "challenge":
-			challenge, _ := generateChallenge(userIDStr)
+			challenge, err := generateChallenge(userIDStr)
+			if err != nil {
+				log.Printf("failed to generate challenge for %s: %v", userIDStr, err)
+				client.sendJSON(map[string]string{"error": "internal error"})
+				continue
+			}
 			client.sendJSON(map[string]string{"challenge": challenge})
 
 		case "auth_verify":

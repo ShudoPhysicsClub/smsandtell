@@ -528,14 +528,13 @@ func handleGetPubkey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	number := strings.TrimPrefix(r.URL.Path, "/pubkey/")
-	email, pubkey, err := getUserByNumber(number)
+	_, pubkey, err := getUserByNumber(number)
 	if err != nil {
 		http.Error(w, "user not found", http.StatusNotFound)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"email":      email,
 		"public_key": pubkey,
 	})
 }
@@ -582,7 +581,12 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, _ := generateToken()
+	token, err := generateToken()
+	if err != nil {
+		log.Printf("failed to generate token: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	tokensMu.Lock()
 	putToken(emailVerifyTokens, token, email)
 	tokensMu.Unlock()
@@ -691,7 +695,12 @@ func handleResetRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, _ := generateToken()
+	token, err := generateToken()
+	if err != nil {
+		log.Printf("failed to generate reset token: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	tokensMu.Lock()
 	putToken(resetTokens, token, email)
 	tokensMu.Unlock()
