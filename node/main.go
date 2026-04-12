@@ -129,7 +129,7 @@ func dbWSCall(action string, payload any, out any) error {
 			continue
 		}
 		if !resp.OK {
-			lastErr = fmt.Errorf(resp.Error)
+			lastErr = fmt.Errorf("%s", resp.Error)
 			if strings.Contains(strings.ToLower(resp.Error), "unauthorized") {
 				resetDBWSConnLocked()
 			}
@@ -423,7 +423,7 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 				conn.WriteJSON(map[string]string{"error": "invalid signature"})
 				continue
 			}
-			if err := saveMessage(&msg); err != nil {
+			if err := deliverOrStore(&msg); err != nil {
 				conn.WriteJSON(map[string]string{"error": "failed to save message"})
 				continue
 			}
@@ -471,7 +471,7 @@ func handleMeshWS(w http.ResponseWriter, r *http.Request) {
 				authed := target.authed
 				var deliverErr error
 				if authed {
-					deliverErr = target.conn.WriteJSON(map[string]any{"action": "messages", "data": msg.Data})
+					deliverErr = target.conn.WriteJSON(map[string]any{"action": "messages", "messages": []map[string]any{msg.Data}})
 				}
 				target.mu.Unlock()
 				if authed && deliverErr == nil {

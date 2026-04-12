@@ -6,6 +6,7 @@ import {
   styleInputBase,
   toErrorText,
 } from './dom';
+import { generateMnemonic, mnemonicToPrivateKeyHex } from './mnemonic';
 import {
   createAccount,
   getPublicKeyByNumber,
@@ -295,8 +296,23 @@ function openNodeWS(number: string): Promise<void> {
     };
 
     ws.onclose = () => {
-      setStatus('node ws closed');
+      if (nodeSocket !== ws) {
+        // すでに別のソケットに置き換えられているか、closeNodeWSで処理済み
+        setStatus('node ws closed');
+        return;
+      }
       nodeSocket = null;
+      if (isAuthenticated) {
+        isAuthenticated = false;
+        pendingChallengeResolver = null;
+        pendingAuthResolver = null;
+        pendingCallAuth = null;
+        cleanupCall();
+        setCallPhase('idle');
+        refreshAuthState();
+        if (setActiveScreenRef) setActiveScreenRef('login');
+      }
+      setStatus('node ws closed');
     };
 
     ws.onmessage = (event) => {
@@ -740,6 +756,49 @@ function normalizeRoutingNumber(route: string): string {
   return value;
 }
 
+/** ニーモニックグリッドに24語を表示し、チェックボックスとボタンの連動も設定する */
+function generateAndShowMnemonic(
+  grid: HTMLElement,
+  statusEl: HTMLElement,
+  onKey: (hex: string) => void,
+  confirmCheck: HTMLInputElement,
+  submitBtn: HTMLButtonElement,
+): void {
+  grid.innerHTML = '';
+  grid.dataset['mnemonic'] = '';
+  statusEl.textContent = '生成中…';
+  confirmCheck.checked = false;
+  submitBtn.disabled = true;
+
+  generateMnemonic().then(({ privateKeyHex, mnemonic }) => {
+    onKey(privateKeyHex);
+    grid.dataset['mnemonic'] = mnemonic;
+    const words = mnemonic.split(' ');
+    words.forEach((word, i) => {
+      const cell = document.createElement('div');
+      cell.style.cssText =
+        'display:flex;align-items:center;gap:4px;padding:4px 6px;background:#fff;border-radius:6px;border:1px solid #dde3f0;font-size:13px';
+      const num = document.createElement('span');
+      num.textContent = `${i + 1}.`;
+      num.style.cssText = 'min-width:20px;font-size:11px;color:#aaa;text-align:right';
+      const wordSpan = document.createElement('span');
+      wordSpan.textContent = word;
+      wordSpan.style.cssText = 'font-family:monospace;font-weight:600;color:#1a2340';
+      cell.appendChild(num);
+      cell.appendChild(wordSpan);
+      grid.appendChild(cell);
+    });
+    statusEl.textContent = '上の24語を必ず控えてください';
+    statusEl.style.color = '#d9534f';
+  }).catch((err: unknown) => {
+    statusEl.textContent = `生成エラー: ${String(err)}`;
+  });
+
+  confirmCheck.onchange = () => {
+    submitBtn.disabled = !confirmCheck.checked;
+  };
+}
+
 export function buildUI(): void {
   const root = document.getElementById('app') ?? document.body;
   root.innerHTML = '';
@@ -845,6 +904,20 @@ export function buildUI(): void {
     const keys: ScreenKey[] = ['login', 'signup', 'reset', 'chat'];
     for (const name of keys) {
       screens[name].style.display = name === targetKey ? 'block' : 'none';
+    }
+    // サインアップ画面を開くときはステップ1に戻す
+    if (targetKey === 'signup') {
+      signupStep1.style.display = '';
+      signupStep2.style.display = 'none';
+      btnRegister.style.display = '';
+      btnCreate.style.display = 'none';
+    }
+    // 再設定画面を開くときはステップ1に戻す
+    if (targetKey === 'reset') {
+      resetStep1.style.display = '';
+      resetStep2.style.display = 'none';
+      btnResetReq.style.display = '';
+      btnResetDo.style.display = 'none';
     }
     syncAuthUI();
   };
@@ -995,6 +1068,45 @@ export function buildUI(): void {
   privateKeyControl.appendChild(persistSensitiveLabel);
   loginCard.appendChild(privateKeyControl);
 
+  // ログイン画面 – ニーモニック復元セクション
+  const mnemonicRestoreToggle = document.createElement('button');
+  mnemonicRestoreToggle.type = 'button';
+  mnemonicRestoreToggle.textContent = '▶ ニーモニックから秘密鍵を復元する';
+  mnemonicRestoreToggle.style.cssText = 'border:none;background:transparent;color:#0a84ff;cursor:pointer;font-size:13px;padding:0;margin-bottom:0.5rem;text-align:left;width:100%';
+  const mnemonicRestoreSection = document.createElement('div');
+  mnemonicRestoreSection.style.display = 'none';
+  mnemonicRestoreSection.style.marginBottom = '1rem';
+  const mnemonicRestoreTextarea = document.createElement('textarea');
+  mnemonicRestoreTextarea.placeholder = '24語のニーモニックをスペース区切りで入力…';
+  mnemonicRestoreTextarea.rows = 3;
+  mnemonicRestoreTextarea.style.cssText = 'width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:8px;padding:8px;font-size:13px;font-family:monospace;resize:vertical;margin-bottom:6px';
+  const btnApplyMnemonic = document.createElement('button');
+  btnApplyMnemonic.type = 'button';
+  btnApplyMnemonic.textContent = 'ニーモニックを適用';
+  btnApplyMnemonic.style.cssText = 'border:none;background:#0a84ff;color:#fff;border-radius:8px;padding:6px 14px;cursor:pointer;font-size:13px';
+  btnApplyMnemonic.onclick = async () => {
+    try {
+      const hex = await mnemonicToPrivateKeyHex(mnemonicRestoreTextarea.value);
+      privateKeyInput.value = hex;
+      privateKeyInput.type = 'text';
+      btnTogglePrivateKey.textContent = '秘密鍵を隠す';
+      setStatus('ニーモニックから秘密鍵を復元しました。ログインしてください。');
+    } catch (err) {
+      setErrorStatus(err);
+    }
+  };
+  mnemonicRestoreSection.appendChild(mnemonicRestoreTextarea);
+  mnemonicRestoreSection.appendChild(btnApplyMnemonic);
+  mnemonicRestoreToggle.onclick = () => {
+    const shown = mnemonicRestoreSection.style.display !== 'none';
+    mnemonicRestoreSection.style.display = shown ? 'none' : 'block';
+    mnemonicRestoreToggle.textContent = shown
+      ? '▶ ニーモニックから秘密鍵を復元する'
+      : '▼ ニーモニックから秘密鍵を復元する';
+  };
+  loginCard.appendChild(mnemonicRestoreToggle);
+  loginCard.appendChild(mnemonicRestoreSection);
+
   const btnLookupConnect = makePrimaryBtn('btnLookupConnect', 'ログイン');
   loginCard.appendChild(btnLookupConnect);
   loginCard.appendChild(makeLinkBtn('新規登録はこちら', () => setActiveScreen('signup')));
@@ -1010,6 +1122,9 @@ export function buildUI(): void {
   const signupEmailInput = createInput('signupEmail', 'メールアドレス');
   const signupTokenInput = createInput('signupToken', 'メールのトークン');
 
+  // 生成した秘密鍵を一時保存（入力フィールドには出さない）
+  let signupGeneratedKeyHex = '';
+
   const signupStep1 = document.createElement('div');
   const signupStep2 = document.createElement('div');
   signupStep2.style.display = 'none';
@@ -1017,13 +1132,70 @@ export function buildUI(): void {
   signupStep1.appendChild(makeFormGroup('ルーティング番号', signupRouteInput));
   signupStep1.appendChild(makeFormGroup('メールアドレス', signupEmailInput));
 
+  // Step2 – ニーモニック表示 UI
   const signupStep2Note = document.createElement('p');
-  signupStep2Note.textContent = '確認メールのトークンを入力して作成してください。';
-  signupStep2Note.style.margin = '0 0 1rem 0';
-  signupStep2Note.style.fontSize = '13px';
-  signupStep2Note.style.color = '#555';
+  signupStep2Note.innerHTML =
+    '新しい秘密鍵を自動生成しました。<br>' +
+    '<strong>以下の24語のニーモニックを紙などに控えてください。</strong><br>' +
+    'このニーモニックがないと秘密鍵を復元できません。';
+  signupStep2Note.style.cssText = 'margin:0 0 0.8rem 0;font-size:13px;color:#333;line-height:1.5';
   signupStep2.appendChild(signupStep2Note);
   signupStep2.appendChild(makeFormGroup('トークン', signupTokenInput));
+
+  // ニーモニック表示グリッド
+  const signupMnemonicGrid = document.createElement('div');
+  signupMnemonicGrid.style.cssText =
+    'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 0.6rem 0;background:#f4f6fb;border-radius:10px;padding:10px';
+  const signupMnemonicStatus = document.createElement('p');
+  signupMnemonicStatus.textContent = '生成中…';
+  signupMnemonicStatus.style.cssText = 'font-size:12px;color:#888;margin:0 0 0.5rem 0;text-align:center';
+  signupStep2.appendChild(signupMnemonicGrid);
+  signupStep2.appendChild(signupMnemonicStatus);
+
+  // コピーボタン
+  const btnSignupCopyMnemonic = document.createElement('button');
+  btnSignupCopyMnemonic.type = 'button';
+  btnSignupCopyMnemonic.textContent = 'ニーモニックをコピー';
+  btnSignupCopyMnemonic.style.cssText =
+    'border:1px solid #0a84ff;background:transparent;color:#0a84ff;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px;margin-right:8px';
+  btnSignupCopyMnemonic.onclick = () => {
+    navigator.clipboard.writeText(signupMnemonicGrid.dataset['mnemonic'] ?? '').then(() => {
+      btnSignupCopyMnemonic.textContent = 'コピー済み ✓';
+      setTimeout(() => { btnSignupCopyMnemonic.textContent = 'ニーモニックをコピー'; }, 2000);
+    });
+  };
+
+  // 再生成ボタン
+  const btnSignupRegen = document.createElement('button');
+  btnSignupRegen.type = 'button';
+  btnSignupRegen.textContent = '再生成';
+  btnSignupRegen.style.cssText =
+    'border:1px solid #888;background:transparent;color:#555;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px';
+  btnSignupRegen.onclick = () => {
+    generateAndShowMnemonic(
+      signupMnemonicGrid, signupMnemonicStatus,
+      (hex) => { signupGeneratedKeyHex = hex; },
+      signupConfirmCheck, btnCreate,
+    );
+  };
+
+  const signupBtnRow = document.createElement('div');
+  signupBtnRow.style.cssText = 'display:flex;gap:8px;margin-bottom:0.8rem';
+  signupBtnRow.appendChild(btnSignupCopyMnemonic);
+  signupBtnRow.appendChild(btnSignupRegen);
+  signupStep2.appendChild(signupBtnRow);
+
+  // 確認チェックボックス
+  const signupConfirmLabel = document.createElement('label');
+  signupConfirmLabel.style.cssText = 'display:flex;align-items:flex-start;gap:6px;font-size:13px;color:#333;margin-bottom:1rem;cursor:pointer';
+  const signupConfirmCheck = document.createElement('input');
+  signupConfirmCheck.type = 'checkbox';
+  signupConfirmCheck.style.marginTop = '2px';
+  const signupConfirmText = document.createElement('span');
+  signupConfirmText.textContent = 'ニーモニックを安全な場所に控えました（このニーモニックが唯一のバックアップです）';
+  signupConfirmLabel.appendChild(signupConfirmCheck);
+  signupConfirmLabel.appendChild(signupConfirmText);
+  signupStep2.appendChild(signupConfirmLabel);
 
   signupCard.appendChild(signupStep1);
   signupCard.appendChild(signupStep2);
@@ -1050,6 +1222,9 @@ export function buildUI(): void {
   const resetEmailInput = createInput('resetEmail', 'メールアドレス');
   const resetTokenInput = createInput('resetToken', '再設定トークン');
 
+  // 生成した新しい秘密鍵を一時保存
+  let resetGeneratedKeyHex = '';
+
   const resetStep1 = document.createElement('div');
   const resetStep2 = document.createElement('div');
   resetStep2.style.display = 'none';
@@ -1057,13 +1232,66 @@ export function buildUI(): void {
   resetStep1.appendChild(makeFormGroup('ルーティング番号', resetRouteInput));
   resetStep1.appendChild(makeFormGroup('メールアドレス', resetEmailInput));
 
+  // Step2 – ニーモニック表示 UI
   const resetStep2Note = document.createElement('p');
-  resetStep2Note.textContent = '再設定メールのトークンを入力してください。';
-  resetStep2Note.style.margin = '0 0 1rem 0';
-  resetStep2Note.style.fontSize = '13px';
-  resetStep2Note.style.color = '#555';
+  resetStep2Note.innerHTML =
+    '新しい秘密鍵を自動生成しました。<br>' +
+    '<strong>以下の24語のニーモニックを紙などに控えてください。</strong><br>' +
+    'このニーモニックがないと秘密鍵を復元できません。';
+  resetStep2Note.style.cssText = 'margin:0 0 0.8rem 0;font-size:13px;color:#333;line-height:1.5';
   resetStep2.appendChild(resetStep2Note);
   resetStep2.appendChild(makeFormGroup('トークン', resetTokenInput));
+
+  const resetMnemonicGrid = document.createElement('div');
+  resetMnemonicGrid.style.cssText =
+    'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 0.6rem 0;background:#f4f6fb;border-radius:10px;padding:10px';
+  const resetMnemonicStatus = document.createElement('p');
+  resetMnemonicStatus.textContent = '生成中…';
+  resetMnemonicStatus.style.cssText = 'font-size:12px;color:#888;margin:0 0 0.5rem 0;text-align:center';
+  resetStep2.appendChild(resetMnemonicGrid);
+  resetStep2.appendChild(resetMnemonicStatus);
+
+  const btnResetCopyMnemonic = document.createElement('button');
+  btnResetCopyMnemonic.type = 'button';
+  btnResetCopyMnemonic.textContent = 'ニーモニックをコピー';
+  btnResetCopyMnemonic.style.cssText =
+    'border:1px solid #0a84ff;background:transparent;color:#0a84ff;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px;margin-right:8px';
+  btnResetCopyMnemonic.onclick = () => {
+    navigator.clipboard.writeText(resetMnemonicGrid.dataset['mnemonic'] ?? '').then(() => {
+      btnResetCopyMnemonic.textContent = 'コピー済み ✓';
+      setTimeout(() => { btnResetCopyMnemonic.textContent = 'ニーモニックをコピー'; }, 2000);
+    });
+  };
+
+  const btnResetRegen = document.createElement('button');
+  btnResetRegen.type = 'button';
+  btnResetRegen.textContent = '再生成';
+  btnResetRegen.style.cssText =
+    'border:1px solid #888;background:transparent;color:#555;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px';
+  btnResetRegen.onclick = () => {
+    generateAndShowMnemonic(
+      resetMnemonicGrid, resetMnemonicStatus,
+      (hex) => { resetGeneratedKeyHex = hex; },
+      resetConfirmCheck, btnResetDo,
+    );
+  };
+
+  const resetBtnRow = document.createElement('div');
+  resetBtnRow.style.cssText = 'display:flex;gap:8px;margin-bottom:0.8rem';
+  resetBtnRow.appendChild(btnResetCopyMnemonic);
+  resetBtnRow.appendChild(btnResetRegen);
+  resetStep2.appendChild(resetBtnRow);
+
+  const resetConfirmLabel = document.createElement('label');
+  resetConfirmLabel.style.cssText = 'display:flex;align-items:flex-start;gap:6px;font-size:13px;color:#333;margin-bottom:1rem;cursor:pointer';
+  const resetConfirmCheck = document.createElement('input');
+  resetConfirmCheck.type = 'checkbox';
+  resetConfirmCheck.style.marginTop = '2px';
+  const resetConfirmText = document.createElement('span');
+  resetConfirmText.textContent = 'ニーモニックを安全な場所に控えました（このニーモニックが唯一のバックアップです）';
+  resetConfirmLabel.appendChild(resetConfirmCheck);
+  resetConfirmLabel.appendChild(resetConfirmText);
+  resetStep2.appendChild(resetConfirmLabel);
 
   resetCard.appendChild(resetStep1);
   resetCard.appendChild(resetStep2);
@@ -1874,6 +2102,10 @@ export function buildUI(): void {
       signupStep2.style.display = 'block';
       btnRegister.style.display = 'none';
       btnCreate.style.display = '';
+      btnCreate.disabled = true;
+      signupConfirmCheck.checked = false;
+      // ステップ2に入ったタイミングで新しい秘密鍵を生成する
+      generateAndShowMnemonic(signupMnemonicGrid, signupMnemonicStatus, (hex) => { signupGeneratedKeyHex = hex; }, signupConfirmCheck, btnCreate);
       signupTokenInput.focus();
     } catch (err) {
       setErrorStatus(err);
@@ -1882,19 +2114,31 @@ export function buildUI(): void {
 
   btnCreate.onclick = async () => {
     try {
+      if (!signupGeneratedKeyHex) throw new Error('秘密鍵が生成されていません。再生成してください。');
+      if (!signupConfirmCheck.checked) throw new Error('ニーモニックを控えたことを確認してください。');
       const route = normalizeRoutingNumber(signupRouteInput.value);
       const seed = await resolveSeed(route);
       windowBase = seed.windowBase;
       localStorage.setItem(LS_WINDOW_BASE, windowBase);
-      const privateKeyHex = normalizePrivateKeyHex(privateKeyInput.value);
+      const privateKeyHex = signupGeneratedKeyHex;
       const pubHex = derivePublicKeyHex(privateKeyHex);
-      localStorage.setItem(LS_PRIVATE_KEY, privateKeyHex);
-      localStorage.setItem(LS_PUBLIC_KEY, pubHex);
+      if (persistSensitiveCheck.checked) {
+        localStorage.setItem(LS_PRIVATE_KEY, privateKeyHex);
+        localStorage.setItem(LS_PUBLIC_KEY, pubHex);
+      } else {
+        localStorage.removeItem(LS_PRIVATE_KEY);
+        localStorage.removeItem(LS_PUBLIC_KEY);
+      }
       const number = await createAccount(windowBase, signupTokenInput.value.trim(), pubHex);
       setStatus(`account created: ${number}`);
       numberInput.value = number;
+      // ログイン画面に戻った際に再入力不要なように秘密鍵を転記（type='password'でマスク済み）
+      privateKeyInput.value = privateKeyHex;
       currentNumber = number;
-      localStorage.setItem(LS_NUMBER, number);
+      if (persistSensitiveCheck.checked) {
+        localStorage.setItem(LS_NUMBER, number);
+        localStorage.setItem(LS_PHONE_NUMBER, number);
+      }
       setActiveScreen('login');
     } catch (err) {
       setErrorStatus(err);
@@ -1913,6 +2157,10 @@ export function buildUI(): void {
       resetStep2.style.display = 'block';
       btnResetReq.style.display = 'none';
       btnResetDo.style.display = '';
+      btnResetDo.disabled = true;
+      resetConfirmCheck.checked = false;
+      // ステップ2に入ったタイミングで新しい秘密鍵を生成する
+      generateAndShowMnemonic(resetMnemonicGrid, resetMnemonicStatus, (hex) => { resetGeneratedKeyHex = hex; }, resetConfirmCheck, btnResetDo);
       resetTokenInput.focus();
     } catch (err) {
       setErrorStatus(err);
@@ -1921,19 +2169,31 @@ export function buildUI(): void {
 
   btnResetDo.onclick = async () => {
     try {
+      if (!resetGeneratedKeyHex) throw new Error('秘密鍵が生成されていません。再生成してください。');
+      if (!resetConfirmCheck.checked) throw new Error('ニーモニックを控えたことを確認してください。');
       const route = normalizeRoutingNumber(resetRouteInput.value);
       const seed = await resolveSeed(route);
       windowBase = seed.windowBase;
       localStorage.setItem(LS_WINDOW_BASE, windowBase);
-      const privateKeyHex = normalizePrivateKeyHex(privateKeyInput.value);
+      const privateKeyHex = resetGeneratedKeyHex;
       const pubHex = derivePublicKeyHex(privateKeyHex);
-      localStorage.setItem(LS_PRIVATE_KEY, privateKeyHex);
-      localStorage.setItem(LS_PUBLIC_KEY, pubHex);
+      if (persistSensitiveCheck.checked) {
+        localStorage.setItem(LS_PRIVATE_KEY, privateKeyHex);
+        localStorage.setItem(LS_PUBLIC_KEY, pubHex);
+      } else {
+        localStorage.removeItem(LS_PRIVATE_KEY);
+        localStorage.removeItem(LS_PUBLIC_KEY);
+      }
       const number = await resetDo(windowBase, resetTokenInput.value.trim(), pubHex);
       setStatus(`reset done: ${number}`);
       numberInput.value = number;
+      // ログイン画面に戻った際に再入力不要なように秘密鍵を転記（type='password'でマスク済み）
+      privateKeyInput.value = privateKeyHex;
       currentNumber = number;
-      localStorage.setItem(LS_NUMBER, number);
+      if (persistSensitiveCheck.checked) {
+        localStorage.setItem(LS_NUMBER, number);
+        localStorage.setItem(LS_PHONE_NUMBER, number);
+      }
       setActiveScreen('login');
     } catch (err) {
       setErrorStatus(err);

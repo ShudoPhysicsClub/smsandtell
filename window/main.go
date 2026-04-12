@@ -177,7 +177,7 @@ func dbWSCall(action string, payload any, out any) error {
 			continue
 		}
 		if !resp.OK {
-			lastErr = fmt.Errorf(resp.Error)
+			lastErr = fmt.Errorf("%s", resp.Error)
 			if strings.Contains(strings.ToLower(resp.Error), "unauthorized") {
 				resetDBWSConnLocked()
 			}
