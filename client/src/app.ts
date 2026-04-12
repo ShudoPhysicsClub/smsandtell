@@ -1969,6 +1969,7 @@ export function buildUI(): void {
       const number = await createAccount(windowBase, signupTokenInput.value.trim(), pubHex);
       setStatus(`account created: ${number}`);
       numberInput.value = number;
+      // ログイン画面に戻った際に再入力不要なように秘密鍵を転記（type='password'でマスク済み）
       privateKeyInput.value = signupPrivateKeyInput.value;
       currentNumber = number;
       if (persistSensitiveCheck.checked) {
@@ -2017,6 +2018,7 @@ export function buildUI(): void {
       const number = await resetDo(windowBase, resetTokenInput.value.trim(), pubHex);
       setStatus(`reset done: ${number}`);
       numberInput.value = number;
+      // ログイン画面に戻った際に再入力不要なように秘密鍵を転記（type='password'でマスク済み）
       privateKeyInput.value = resetPrivateKeyInput.value;
       currentNumber = number;
       if (persistSensitiveCheck.checked) {
