@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -74,9 +75,13 @@ func initDB() error {
 	return nil
 }
 
-func generateUserNumber() (string, error) {
+func generateUserNumber(route string) (string, error) {
+	prefix := strings.TrimSpace(route)
+	if prefix == "" {
+		prefix = serviceNumber
+	}
 	for {
-		candidate := fmt.Sprintf("%06d-%06d", time.Now().UTC().Unix()%1000000, time.Now().UTC().UnixNano()%1000000)
+		candidate := fmt.Sprintf("%s-%06d", prefix, time.Now().UTC().UnixNano()%1000000)
 		var exists int
 		err := db.QueryRow("SELECT COUNT(*) FROM users WHERE number = ?", candidate).Scan(&exists)
 		if err != nil {
@@ -185,7 +190,7 @@ func handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing email or public_key", http.StatusBadRequest)
 		return
 	}
-	number, err := generateUserNumber()
+	number, err := generateUserNumber("")
 	if err != nil {
 		http.Error(w, "failed to generate number", http.StatusInternalServerError)
 		return
@@ -410,19 +415,28 @@ func handleDBWS(w http.ResponseWriter, r *http.Request) {
 			}
 
 			messages := make([]Message, 0)
+			var scanErr error
 			for rows.Next() {
 				var m Message
 				var msgJSON string
 				if err := rows.Scan(&m.ID, &m.Timestamp, &msgJSON, &m.To, &m.From, &m.Sig); err != nil {
-					rows.Close()
-					_ = tx.Rollback()
-					writeWSError(conn, "scan failed")
-					continue
+					scanErr = err
+					break // continue→breakに変更: ロールバック済みtxの再利用を防ぐ
 				}
 				m.Message = json.RawMessage(msgJSON)
 				messages = append(messages, m)
 			}
 			rows.Close()
+			if scanErr != nil {
+				_ = tx.Rollback()
+				writeWSError(conn, "scan failed")
+				continue // 外側のforループを正しく継続する
+			}
+			if err := rows.Err(); err != nil {
+				_ = tx.Rollback()
+				writeWSError(conn, "rows error")
+				continue
+			}
 
 			if len(messages) > 0 {
 				if _, err := tx.Exec("DELETE FROM messages WHERE to_user = ?", in.To); err != nil {
@@ -471,12 +485,13 @@ func handleDBWS(w http.ResponseWriter, r *http.Request) {
 			var in struct {
 				Email     string `json:"email"`
 				PublicKey string `json:"public_key"`
+				Route     string `json:"route"`
 			}
 			if err := json.Unmarshal(req.Data, &in); err != nil || in.Email == "" || in.PublicKey == "" {
 				writeWSError(conn, "missing email or public_key")
 				continue
 			}
-			number, err := generateUserNumber()
+			number, err := generateUserNumber(in.Route)
 			if err != nil {
 				writeWSError(conn, "failed to generate number")
 				continue

@@ -25,6 +25,7 @@ var upgrader = websocket.Upgrader{
 var dbServiceURL string
 var dbServiceToken string
 var seedDomain string
+var routeNumber string // このwindowサーバーのルーティングプレフィックス（例: "02"）
 var dbWSConn *websocket.Conn
 var dbWSMu sync.Mutex
 
@@ -242,7 +243,7 @@ func createUser(email string, pubkey string) (number string, err error) {
 	var out struct {
 		Number string `json:"number"`
 	}
-	err = dbWSCall("users.create", map[string]string{"email": email, "public_key": pubkey}, &out)
+	err = dbWSCall("users.create", map[string]string{"email": email, "public_key": pubkey, "route": routeNumber}, &out)
 	if err != nil {
 		return "", err
 	}
@@ -1007,10 +1008,10 @@ func main() {
 	certFile := os.Getenv("CERT_FILE")
 	keyFile := os.Getenv("KEY_FILE")
 	seedDomain = fixedSeedDomain
-	number := os.Getenv("NUMBER") // 例: 02
+	routeNumber = os.Getenv("NUMBER") // 例: 02
 
-	if seedDomain != "" && number != "" {
-		startSeedWatcher(seedDomain, number)
+	if seedDomain != "" && routeNumber != "" {
+		startSeedWatcher(seedDomain, routeNumber)
 	} else {
 		log.Println("fixed seed domain or NUMBER not set, skipping DNS seed")
 	}

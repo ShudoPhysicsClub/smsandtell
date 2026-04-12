@@ -220,6 +220,9 @@ func Verify(pub PublicKey, msg []byte, sig Signature) bool {
 	if s.Sign() <= 0 || s.Cmp(params.N) >= 0 {
 		return false
 	}
+	if !curve.IsOnCurve(Rx, Ry) {
+		return false
+	}
 
 	h := sha256.New()
 	h.Write(sig[:32])   // Rx
