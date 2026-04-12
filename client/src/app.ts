@@ -1022,8 +1022,62 @@ export function buildUI(): void {
   privateKeyInput.value = localStorage.getItem(LS_PRIVATE_KEY) ?? '';
   let privateKeyMaskTimer: number | null = null;
 
+  // --- メインセクション: 番号 + ニーモニック ---
   loginCard.appendChild(makeFormGroup('番号', numberInput));
-  loginCard.appendChild(makeFormGroup('秘密鍵', privateKeyInput));
+
+  // ニーモニック入力（メイン）
+  const mnemonicLoginGroup = document.createElement('div');
+  mnemonicLoginGroup.style.marginBottom = '1.2rem';
+  const mnemonicLoginLabel = document.createElement('label');
+  mnemonicLoginLabel.textContent = 'ニーモニック';
+  mnemonicLoginLabel.style.cssText = 'display:block;margin-bottom:0.4rem;font-weight:600;font-size:12px;color:#aaa;text-transform:uppercase';
+  const mnemonicLoginTextarea = document.createElement('textarea');
+  mnemonicLoginTextarea.id = 'mnemonicLogin';
+  mnemonicLoginTextarea.placeholder = '24語のニーモニックをスペース区切りで入力…';
+  mnemonicLoginTextarea.rows = 3;
+  mnemonicLoginTextarea.style.cssText = 'width:100%;box-sizing:border-box;border:none;border-radius:15px;padding:12px 16px;font-size:13px;font-family:monospace;resize:vertical;background:rgba(255,255,255,.1);color:#fff;outline:none';
+  mnemonicLoginTextarea.addEventListener('focus', () => { mnemonicLoginTextarea.style.background = 'rgba(255,255,255,.18)'; });
+  mnemonicLoginTextarea.addEventListener('blur', () => { mnemonicLoginTextarea.style.background = 'rgba(255,255,255,.1)'; });
+  mnemonicLoginGroup.appendChild(mnemonicLoginLabel);
+  mnemonicLoginGroup.appendChild(mnemonicLoginTextarea);
+  loginCard.appendChild(mnemonicLoginGroup);
+
+  // 端末に保存
+  const persistSensitiveLabel = document.createElement('label');
+  persistSensitiveLabel.style.display = 'inline-flex';
+  persistSensitiveLabel.style.alignItems = 'center';
+  persistSensitiveLabel.style.gap = '6px';
+  persistSensitiveLabel.style.fontSize = '12px';
+  persistSensitiveLabel.style.color = 'rgba(255,255,255,.7)';
+  persistSensitiveLabel.style.marginBottom = '1.2rem';
+  const persistSensitiveCheck = document.createElement('input');
+  persistSensitiveCheck.type = 'checkbox';
+  persistSensitiveCheck.checked = (localStorage.getItem(LS_PERSIST_SENSITIVE) ?? '1') !== '0';
+  const persistSensitiveText = document.createElement('span');
+  persistSensitiveText.textContent = '端末に保存';
+  persistSensitiveLabel.appendChild(persistSensitiveCheck);
+  persistSensitiveLabel.appendChild(persistSensitiveText);
+  loginCard.appendChild(persistSensitiveLabel);
+
+  const btnLookupConnect = makePrimaryBtn('btnLookupConnect', 'ログイン');
+  loginCard.appendChild(btnLookupConnect);
+
+  // HR 区切り線
+  const loginHr = document.createElement('div');
+  loginHr.style.cssText = 'height:2px;margin:30px 0 20px 0;background:rgba(255,255,255,.2)';
+  loginCard.appendChild(loginHr);
+
+  // --- サブセクション: 秘密鍵で直接ログイン（折りたたみ）---
+  const privateKeyToggle = document.createElement('button');
+  privateKeyToggle.type = 'button';
+  privateKeyToggle.textContent = '▶ 秘密鍵で直接ログインする';
+  privateKeyToggle.style.cssText = 'border:none;background:transparent;color:rgba(255,255,255,.7);cursor:pointer;font-size:13px;padding:0;margin-bottom:0.5rem;text-align:left;width:100%';
+
+  const privateKeySection = document.createElement('div');
+  privateKeySection.style.display = 'none';
+  privateKeySection.style.marginBottom = '1rem';
+
+  privateKeySection.appendChild(makeFormGroup('秘密鍵', privateKeyInput));
 
   const privateKeyControl = document.createElement('div');
   privateKeyControl.style.marginBottom = '1rem';
@@ -1054,66 +1108,19 @@ export function buildUI(): void {
       btnTogglePrivateKey.textContent = '秘密鍵を表示';
     }, 5000);
   });
-
-  const persistSensitiveLabel = document.createElement('label');
-  persistSensitiveLabel.style.display = 'inline-flex';
-  persistSensitiveLabel.style.alignItems = 'center';
-  persistSensitiveLabel.style.gap = '6px';
-  persistSensitiveLabel.style.fontSize = '12px';
-  persistSensitiveLabel.style.color = 'rgba(255,255,255,.7)';
-  const persistSensitiveCheck = document.createElement('input');
-  persistSensitiveCheck.type = 'checkbox';
-  persistSensitiveCheck.checked = (localStorage.getItem(LS_PERSIST_SENSITIVE) ?? '1') !== '0';
-  const persistSensitiveText = document.createElement('span');
-  persistSensitiveText.textContent = '端末に保存';
-  persistSensitiveLabel.appendChild(persistSensitiveCheck);
-  persistSensitiveLabel.appendChild(persistSensitiveText);
-
   privateKeyControl.appendChild(btnTogglePrivateKey);
-  privateKeyControl.appendChild(persistSensitiveLabel);
-  loginCard.appendChild(privateKeyControl);
+  privateKeySection.appendChild(privateKeyControl);
 
-  // ログイン画面 – ニーモニック復元セクション
-  const mnemonicRestoreToggle = document.createElement('button');
-  mnemonicRestoreToggle.type = 'button';
-  mnemonicRestoreToggle.textContent = '▶ ニーモニックから秘密鍵を復元する';
-  mnemonicRestoreToggle.style.cssText = 'border:none;background:transparent;color:rgba(255,255,255,.7);cursor:pointer;font-size:13px;padding:0;margin-bottom:0.5rem;text-align:left;width:100%';
-  const mnemonicRestoreSection = document.createElement('div');
-  mnemonicRestoreSection.style.display = 'none';
-  mnemonicRestoreSection.style.marginBottom = '1rem';
-  const mnemonicRestoreTextarea = document.createElement('textarea');
-  mnemonicRestoreTextarea.placeholder = '24語のニーモニックをスペース区切りで入力…';
-  mnemonicRestoreTextarea.rows = 3;
-  mnemonicRestoreTextarea.style.cssText = 'width:100%;box-sizing:border-box;border:1px solid rgba(255,255,255,.2);border-radius:8px;padding:8px;font-size:13px;font-family:monospace;resize:vertical;margin-bottom:6px;background:rgba(255,255,255,.1);color:#fff';
-  const btnApplyMnemonic = document.createElement('button');
-  btnApplyMnemonic.type = 'button';
-  btnApplyMnemonic.textContent = 'ニーモニックを適用';
-  btnApplyMnemonic.style.cssText = 'border:none;background:#1161ee;color:#fff;border-radius:25px;padding:8px 18px;cursor:pointer;font-size:13px';
-  btnApplyMnemonic.onclick = async () => {
-    try {
-      const hex = await mnemonicToPrivateKeyHex(mnemonicRestoreTextarea.value);
-      privateKeyInput.value = hex;
-      privateKeyInput.type = 'text';
-      btnTogglePrivateKey.textContent = '秘密鍵を隠す';
-      setStatus('ニーモニックから秘密鍵を復元しました。ログインしてください。');
-    } catch (err) {
-      setErrorStatus(err);
-    }
+  privateKeyToggle.onclick = () => {
+    const shown = privateKeySection.style.display !== 'none';
+    privateKeySection.style.display = shown ? 'none' : 'block';
+    privateKeyToggle.textContent = shown
+      ? '▶ 秘密鍵で直接ログインする'
+      : '▼ 秘密鍵で直接ログインする';
   };
-  mnemonicRestoreSection.appendChild(mnemonicRestoreTextarea);
-  mnemonicRestoreSection.appendChild(btnApplyMnemonic);
-  mnemonicRestoreToggle.onclick = () => {
-    const shown = mnemonicRestoreSection.style.display !== 'none';
-    mnemonicRestoreSection.style.display = shown ? 'none' : 'block';
-    mnemonicRestoreToggle.textContent = shown
-      ? '▶ ニーモニックから秘密鍵を復元する'
-      : '▼ ニーモニックから秘密鍵を復元する';
-  };
-  loginCard.appendChild(mnemonicRestoreToggle);
-  loginCard.appendChild(mnemonicRestoreSection);
+  loginCard.appendChild(privateKeyToggle);
+  loginCard.appendChild(privateKeySection);
 
-  const btnLookupConnect = makePrimaryBtn('btnLookupConnect', 'ログイン');
-  loginCard.appendChild(btnLookupConnect);
   loginCard.appendChild(makeLinkBtn('新規登録はこちら', () => setActiveScreen('signup')));
   loginCard.appendChild(makeLinkBtn('パスワードを忘れた方', () => setActiveScreen('reset')));
   loginScreen.appendChild((loginCard as Record<string, unknown>)['__outerWrap'] as HTMLElement ?? loginCard);
@@ -2027,7 +2034,10 @@ export function buildUI(): void {
 
   const doLogin = async (opts?: { silent?: boolean }): Promise<void> => {
     currentNumber = numberInput.value.trim();
-    const privateKeyHex = normalizePrivateKeyHex(privateKeyInput.value);
+    const mnemonicValue = mnemonicLoginTextarea.value.trim();
+    const privateKeyHex = mnemonicValue
+      ? await mnemonicToPrivateKeyHex(mnemonicValue)
+      : normalizePrivateKeyHex(privateKeyInput.value);
 
     if (!currentNumber) {
       throw new Error('number は必須');
