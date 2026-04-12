@@ -2291,6 +2291,8 @@ export function buildUI(): void {
   };
 
   btnSendSMS.onclick = async () => {
+    if (btnSendSMS.disabled) return;
+    btnSendSMS.disabled = true;
     let pendingId = '';
     try {
       ensureAuthenticated();
@@ -2341,6 +2343,8 @@ export function buildUI(): void {
         persistThread();
       }
       setErrorStatus(err);
+    } finally {
+      btnSendSMS.disabled = false;
     }
   };
 
