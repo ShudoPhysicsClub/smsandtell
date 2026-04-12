@@ -43,6 +43,15 @@ var (
 	clientsMu sync.RWMutex
 )
 
+// sendJSON は client.mu を保持した状態で WebSocket に JSON を書き込む。
+// handleClientWS 内の直接 conn.WriteJSON 呼び出しと deliverOrStore / mesh relay の
+// 並行書き込みを防ぐため、すべての送信はこのメソッドを経由する。
+func (c *ClientConn) sendJSON(v any) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.WriteJSON(v)
+}
+
 type Message struct {
 	Timestamp int64           `json:"timestamp"`
 	Message   json.RawMessage `json:"message"`
@@ -319,6 +328,31 @@ var (
 	challengesMu sync.RWMutex
 )
 
+// startChallengeSweeper は期限切れチャレンジを定期的にメモリから削除する。
+// 認証を完了しないままの接続が残した場合でもメモリリークしないようにする。
+func startChallengeSweeper() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			challengesMu.Lock()
+			for userID, items := range challenges {
+				for ch, exp := range items {
+					t, err := time.Parse(time.RFC3339, exp)
+					if err != nil || now.After(t) {
+						delete(items, ch)
+					}
+				}
+				if len(items) == 0 {
+					delete(challenges, userID)
+				}
+			}
+			challengesMu.Unlock()
+		}
+	}()
+}
+
 func generateChallenge(userID string) (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -374,63 +408,63 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 
 		action, ok := req["action"].(string)
 		if !ok {
-			conn.WriteJSON(map[string]string{"error": "missing action"})
+			client.sendJSON(map[string]string{"error": "missing action"})
 			continue
 		}
 
 		switch action {
 		case "challenge":
 			challenge, _ := generateChallenge(userIDStr)
-			conn.WriteJSON(map[string]string{"challenge": challenge})
+			client.sendJSON(map[string]string{"challenge": challenge})
 
 		case "auth_verify":
 			challenge, _ := req["challenge"].(string)
 			sig, _ := req["sig"].(string)
 			if challenge == "" || sig == "" {
-				conn.WriteJSON(map[string]string{"error": "missing challenge or sig"})
+				client.sendJSON(map[string]string{"error": "missing challenge or sig"})
 				continue
 			}
 			if err := verifyAuthSignature(userIDStr, challenge, sig); err != nil {
-				conn.WriteJSON(map[string]string{"error": "auth failed"})
+				client.sendJSON(map[string]string{"error": "auth failed"})
 				continue
 			}
 			authenticated = true
 			client.mu.Lock()
 			client.authed = true
 			client.mu.Unlock()
-			conn.WriteJSON(map[string]string{"status": "authenticated"})
+			client.sendJSON(map[string]string{"status": "authenticated"})
 
 			messages, err := popMessages(userIDStr)
 			if err == nil && len(messages) > 0 {
-				if err := conn.WriteJSON(map[string]interface{}{"action": "messages", "messages": messages}); err != nil {
+				if err := client.sendJSON(map[string]interface{}{"action": "messages", "messages": messages}); err != nil {
 					log.Printf("failed to send cached messages: %v", err)
 				}
 			}
 
 		case "send_message":
 			if !authenticated {
-				conn.WriteJSON(map[string]string{"error": "not authenticated"})
+				client.sendJSON(map[string]string{"error": "not authenticated"})
 				continue
 			}
 			msgData, _ := json.Marshal(req["data"])
 			var msg Message
 			if err := json.Unmarshal(msgData, &msg); err != nil {
-				conn.WriteJSON(map[string]string{"error": "invalid message"})
+				client.sendJSON(map[string]string{"error": "invalid message"})
 				continue
 			}
 			msg.From = userIDStr
 			if err := verifyMessageSignature(&msg); err != nil {
-				conn.WriteJSON(map[string]string{"error": "invalid signature"})
+				client.sendJSON(map[string]string{"error": "invalid signature"})
 				continue
 			}
 			if err := deliverOrStore(&msg); err != nil {
-				conn.WriteJSON(map[string]string{"error": "failed to save message"})
+				client.sendJSON(map[string]string{"error": "failed to save message"})
 				continue
 			}
-			conn.WriteJSON(map[string]string{"status": "ok"})
+			client.sendJSON(map[string]string{"status": "ok"})
 
 		default:
-			conn.WriteJSON(map[string]string{"error": "unknown action"})
+			client.sendJSON(map[string]string{"error": "unknown action"})
 		}
 	}
 }
@@ -526,6 +560,8 @@ func main() {
 	if err := initDBService(); err != nil {
 		log.Fatal(err)
 	}
+
+	startChallengeSweeper()
 
 	port := os.Getenv("PORT")
 	if port == "" {

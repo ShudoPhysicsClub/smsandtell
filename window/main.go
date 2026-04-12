@@ -102,6 +102,20 @@ func getTokenEmail(store map[string]tokenEntry, token string) (string, bool) {
 	return entry.Email, true
 }
 
+// atomicConsumeToken はトークンの有効性チェックと削除を書き込みロック下でアトミックに行う。
+// RLock → Unlock → Lock の TOCTOU 競合を防ぎ、同一トークンの並行使用を排除する。
+func atomicConsumeToken(store map[string]tokenEntry, token string) (string, bool) {
+	tokensMu.Lock()
+	defer tokensMu.Unlock()
+	entry, ok := store[token]
+	if !ok || time.Now().After(entry.ExpiresAt) {
+		delete(store, token) // 期限切れも即削除
+		return "", false
+	}
+	delete(store, token)
+	return entry.Email, true
+}
+
 // --- DBサービス ---
 
 func initDBService() error {
@@ -628,10 +642,7 @@ func handleNew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tokensMu.RLock()
-	email, ok := getTokenEmail(emailVerifyTokens, token)
-	tokensMu.RUnlock()
-
+	email, ok := atomicConsumeToken(emailVerifyTokens, token)
 	if !ok {
 		http.Error(w, "invalid token", http.StatusUnauthorized)
 		return
@@ -643,10 +654,6 @@ func handleNew(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "creation failed", http.StatusInternalServerError)
 		return
 	}
-
-	tokensMu.Lock()
-	delete(emailVerifyTokens, token)
-	tokensMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"number": number})
@@ -713,10 +720,7 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tokensMu.RLock()
-	email, ok := getTokenEmail(resetTokens, token)
-	tokensMu.RUnlock()
-
+	email, ok := atomicConsumeToken(resetTokens, token)
 	if !ok {
 		http.Error(w, "invalid token", http.StatusUnauthorized)
 		return
@@ -728,10 +732,6 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "reset failed", http.StatusInternalServerError)
 		return
 	}
-
-	tokensMu.Lock()
-	delete(resetTokens, token)
-	tokensMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"number": number, "status": "ok"})

@@ -2268,6 +2268,7 @@ export function buildUI(): void {
   };
 
   btnSendSMS.onclick = async () => {
+    let pendingId = '';
     try {
       ensureAuthenticated();
       const to = smsToInput.value.trim();
@@ -2284,9 +2285,9 @@ export function buildUI(): void {
         normalizePrivateKeyHex((privateKeyInput.value || localStorage.getItem(LS_PRIVATE_KEY)) ?? '');
       const sig = makeMessageSignatureHex(from, to, { body }, timestamp, privateKeyHex);
 
-      const id = crypto.randomUUID();
+      pendingId = crypto.randomUUID();
       chatItems.push({
-        id,
+        id: pendingId,
         from,
         to,
         body,
@@ -2300,7 +2301,7 @@ export function buildUI(): void {
       persistThread();
 
       await sendSMS(windowBase, to, from, body, sig, timestamp);
-      const target = chatItems.find((x) => x.id === id);
+      const target = chatItems.find((x) => x.id === pendingId);
       if (target) target.status = 'sent';
       renderChatItems();
       renderThreadList();
@@ -2308,10 +2309,10 @@ export function buildUI(): void {
       setStatus('sms sent');
       smsBody.value = '';
     } catch (err) {
-      const latest = chatItems.find((x) => x.status === 'sending');
-      if (latest) {
-        latest.status = 'failed';
-        latest.reason = toErrorText(err);
+      const failed = pendingId ? chatItems.find((x) => x.id === pendingId) : null;
+      if (failed) {
+        failed.status = 'failed';
+        failed.reason = toErrorText(err);
         renderChatItems();
         renderThreadList();
         persistThread();
