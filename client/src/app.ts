@@ -322,7 +322,13 @@ function openNodeWS(number: string): Promise<void> {
     };
 
     ws.onmessage = (event) => {
-      const data = JSON.parse(String(event.data)) as NodeInbound;
+      let data: NodeInbound;
+      try {
+        data = JSON.parse(String(event.data)) as NodeInbound;
+      } catch {
+        // サーバーから不正なJSONが届いた場合は無視して接続を維持する
+        return;
+      }
 
       if (data.challenge) {
         currentChallenge = String(data.challenge);
@@ -351,7 +357,7 @@ function openNodeWS(number: string): Promise<void> {
           const old = signalInboxNode.textContent ?? '';
           signalInboxNode.textContent = `${data.action}\n${pretty}\n\n${old}`.trim();
         }
-        void handleSignalAction(String(data.action), data.data);
+        handleSignalAction(String(data.action), data.data).catch((err: unknown) => setErrorStatus(err));
         return;
       }
 
@@ -367,7 +373,7 @@ function openNodeWS(number: string): Promise<void> {
           const old = signalInboxNode.textContent ?? '';
           signalInboxNode.textContent = `${data.action}\n${pretty}\n\n${old}`.trim();
         }
-        void handleSignalAction(String(data.action), data.data);
+        handleSignalAction(String(data.action), data.data).catch((err: unknown) => setErrorStatus(err));
         return;
       }
 
@@ -1876,7 +1882,13 @@ export function buildUI(): void {
       delete contactNames[key];
     }
     if (!currentNumber) return;
-    const rec = await loadThread(currentNumber);
+    let rec: ChatThreadRecord | null = null;
+    try {
+      rec = await loadThread(currentNumber);
+    } catch {
+      // IndexedDB が利用できない環境ではチャット履歴なしで続行する
+      return;
+    }
     if (!rec) return;
     try {
       for (const it of rec.items ?? []) {
