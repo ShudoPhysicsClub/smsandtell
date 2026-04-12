@@ -180,9 +180,11 @@ func Sign(priv PrivateKey, msg []byte) (Signature, error) {
 
 	Rx, Ry := curve.ScalarBaseMult(k.Bytes())
 
+	rxb := bigToBytes32(Rx)
+	ryb := bigToBytes32(Ry)
 	h := sha256.New()
-	h.Write(Rx.Bytes())
-	h.Write(Ry.Bytes())
+	h.Write(rxb[:])
+	h.Write(ryb[:])
 	h.Write(pub[:32]) // Yx
 	h.Write(pub[32:]) // Yy
 	h.Write(msgBytes)
@@ -194,8 +196,6 @@ func Sign(priv PrivateKey, msg []byte) (Signature, error) {
 	s.Mod(s, params.N)
 
 	var sig Signature
-	rxb := bigToBytes32(Rx)
-	ryb := bigToBytes32(Ry)
 	sb := bigToBytes32(s)
 	copy(sig[:32], rxb[:])
 	copy(sig[32:64], ryb[:])
@@ -218,6 +218,9 @@ func Verify(pub PublicKey, msg []byte, sig Signature) bool {
 	Ry := bytesToBig(sig[32:64])
 	s := bytesToBig(sig[64:])
 	if s.Sign() <= 0 || s.Cmp(params.N) >= 0 {
+		return false
+	}
+	if !curve.IsOnCurve(Rx, Ry) {
 		return false
 	}
 

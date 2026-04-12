@@ -33,6 +33,9 @@ let nodeSocket: WebSocket | null = null;
 let currentNumber = '';
 let currentChallenge = '';
 let isAuthenticated = false;
+// currentPrivateKeyHex はセッション中のみメモリに保持する秘密鍵（永続化しない）。
+// persist=off の場合でも通話認証・SMS署名に使用できるようにする。
+let currentPrivateKeyHex = '';
 let pendingChallengeResolver: ((challenge: string) => void) | null = null;
 let pendingAuthResolver: (() => void) | null = null;
 
@@ -51,6 +54,8 @@ let callPeer: RTCPeerConnection | null = null;
 let localStream: MediaStream | null = null;
 let remoteAudioNode: HTMLAudioElement | null = null;
 let activeCallPeer = '';
+// remoteDescriptionが設定される前に届いたICE candidateをバッファする
+let pendingIceCandidates: RTCIceCandidateInit[] = [];
 let pendingCallAuth:
   | {
       peer: string;
@@ -264,6 +269,7 @@ function closeNodeWS(): void {
     nodeSocket = null;
   }
   isAuthenticated = false;
+  currentPrivateKeyHex = '';
   pendingChallengeResolver = null;
   pendingAuthResolver = null;
   pendingCallAuth = null;
@@ -316,7 +322,13 @@ function openNodeWS(number: string): Promise<void> {
     };
 
     ws.onmessage = (event) => {
-      const data = JSON.parse(String(event.data)) as NodeInbound;
+      let data: NodeInbound;
+      try {
+        data = JSON.parse(String(event.data)) as NodeInbound;
+      } catch {
+        // サーバーから不正なJSONが届いた場合は無視して接続を維持する
+        return;
+      }
 
       if (data.challenge) {
         currentChallenge = String(data.challenge);
@@ -345,7 +357,7 @@ function openNodeWS(number: string): Promise<void> {
           const old = signalInboxNode.textContent ?? '';
           signalInboxNode.textContent = `${data.action}\n${pretty}\n\n${old}`.trim();
         }
-        void handleSignalAction(String(data.action), data.data);
+        handleSignalAction(String(data.action), data.data).catch((err: unknown) => setErrorStatus(err));
         return;
       }
 
@@ -361,7 +373,7 @@ function openNodeWS(number: string): Promise<void> {
           const old = signalInboxNode.textContent ?? '';
           signalInboxNode.textContent = `${data.action}\n${pretty}\n\n${old}`.trim();
         }
-        void handleSignalAction(String(data.action), data.data);
+        handleSignalAction(String(data.action), data.data).catch((err: unknown) => setErrorStatus(err));
         return;
       }
 
@@ -619,6 +631,7 @@ function cleanupCall(): void {
     micAudioCtx = null;
   }
   activeCallPeer = '';
+  pendingIceCandidates = [];
   localMicMuted = false;
   if (syncCallRuntimeRef) {
     syncCallRuntimeRef();
@@ -629,7 +642,16 @@ async function ensurePeerForTarget(target: string): Promise<RTCPeerConnection> {
   if (!target) throw new Error('missing call target');
   if (callPeer && activeCallPeer === target) return callPeer;
   cleanupCall();
-  const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  const pc = new RTCPeerConnection({
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' },
+      { urls: 'stun:stun4.l.google.com:19302' },
+    ],
+    iceCandidatePoolSize: 10,
+  });
   const stream = await ensureLocalStream();
   for (const track of stream.getTracks()) {
     pc.addTrack(track, stream);
@@ -663,6 +685,11 @@ async function handleSignalAction(action: string, payload: unknown): Promise<voi
     setCallPhase('ringing', `${from} から着信`);
     const pc = await ensurePeerForTarget(from);
     await pc.setRemoteDescription(new RTCSessionDescription(offer));
+    // remoteDescriptionが設定されたのでバッファ済みcandidateを処理する
+    const queued = pendingIceCandidates.splice(0);
+    for (const c of queued) {
+      await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+    }
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     await sendICEAnswer(windowBase, { from: currentNumber, to: from, answer: pc.localDescription?.toJSON() ?? answer });
@@ -674,6 +701,11 @@ async function handleSignalAction(action: string, payload: unknown): Promise<voi
     const answer = body.answer as RTCSessionDescriptionInit | undefined;
     if (!from || !answer || !callPeer) return;
     await callPeer.setRemoteDescription(new RTCSessionDescription(answer));
+    // remoteDescriptionが設定されたのでバッファ済みcandidateを処理する
+    const queued = pendingIceCandidates.splice(0);
+    for (const c of queued) {
+      await callPeer.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+    }
     const publicKeyHex = await getPublicKeyByNumber(windowBase, from);
     const challenge = createChallengeHex();
     pendingCallAuth = { peer: from, challenge, publicKeyHex };
@@ -685,15 +717,23 @@ async function handleSignalAction(action: string, payload: unknown): Promise<voi
 
   if (action === 'ice_candidate') {
     const candidate = body.candidate as RTCIceCandidateInit | undefined;
-    if (!candidate || !callPeer) return;
-    await callPeer.addIceCandidate(new RTCIceCandidate(candidate));
+    if (!candidate) return;
+    // peerConnectionが未作成またはremoteDescriptionが未設定ならキューに追加
+    if (!callPeer || callPeer.remoteDescription === null) {
+      pendingIceCandidates.push(candidate);
+      return;
+    }
+    await callPeer.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
     return;
   }
 
   if (action === 'call_auth_challenge') {
     const challenge = String(body.challenge ?? '').trim();
     if (!from || !challenge) return;
-    const privateKeyHex = normalizePrivateKeyHex(localStorage.getItem(LS_PRIVATE_KEY) ?? '');
+    // セッション中の秘密鍵を優先。persist=offでlocalStorageにない場合でも動作する
+    const privateKeyHex =
+      currentPrivateKeyHex ||
+      normalizePrivateKeyHex(localStorage.getItem(LS_PRIVATE_KEY) ?? '');
     const sig = makeAuthSignatureHex(currentNumber, challenge, privateKeyHex);
     setCallPhase('verifying', `${from} に認証応答を送信`);
     await sendCallAuthResponse(windowBase, { from: currentNumber, to: from, challenge, sig });
@@ -777,13 +817,13 @@ function generateAndShowMnemonic(
     words.forEach((word, i) => {
       const cell = document.createElement('div');
       cell.style.cssText =
-        'display:flex;align-items:center;gap:4px;padding:4px 6px;background:#fff;border-radius:6px;border:1px solid #dde3f0;font-size:13px';
+        'display:flex;align-items:center;gap:4px;padding:5px 8px;background:rgba(255,255,255,0.08);border-radius:8px;border:1px solid rgba(255,255,255,0.12);font-size:13px';
       const num = document.createElement('span');
       num.textContent = `${i + 1}.`;
-      num.style.cssText = 'min-width:20px;font-size:11px;color:#aaa;text-align:right';
+      num.style.cssText = 'min-width:20px;font-size:11px;color:rgba(255,255,255,0.4);text-align:right';
       const wordSpan = document.createElement('span');
       wordSpan.textContent = word;
-      wordSpan.style.cssText = 'font-family:monospace;font-weight:600;color:#1a2340';
+      wordSpan.style.cssText = 'font-family:monospace;font-weight:600;color:#e8e6ff';
       cell.appendChild(num);
       cell.appendChild(wordSpan);
       grid.appendChild(cell);
@@ -815,7 +855,7 @@ export function buildUI(): void {
   document.documentElement.style.height = '100%';
   document.body.style.height = '100%';
   document.body.style.margin = '0';
-  document.body.style.background = '#f2f2f7';
+  document.body.style.background = '#13111c';
   document.body.style.overflow = 'hidden';
 
   const container = document.createElement('div');
@@ -838,13 +878,13 @@ export function buildUI(): void {
   statusNode = document.createElement('div');
   statusNode.id = 'status';
   statusNode.textContent = 'ready';
-  statusNode.style.padding = '10px 12px';
+  statusNode.style.padding = '8px 14px';
   statusNode.style.marginBottom = '12px';
-  statusNode.style.background = '#ffffff';
-  statusNode.style.border = '1px solid #e4e0d2';
+  statusNode.style.background = 'rgba(108,99,255,0.1)';
+  statusNode.style.border = '1px solid rgba(108,99,255,0.2)';
   statusNode.style.borderRadius = '12px';
-  statusNode.style.color = '#3b3f53';
-  statusNode.style.fontSize = '13px';
+  statusNode.style.color = 'rgba(200,196,255,0.9)';
+  statusNode.style.fontSize = '12px';
 
   container.appendChild(h1);
   refreshAuthState();
@@ -903,7 +943,7 @@ export function buildUI(): void {
     activeScreenKey = targetKey;
     const keys: ScreenKey[] = ['login', 'signup', 'reset', 'chat'];
     for (const name of keys) {
-      screens[name].style.display = name === targetKey ? 'block' : 'none';
+      screens[name].style.display = name === targetKey ? (name !== 'chat' ? 'flex' : 'block') : 'none';
     }
     // サインアップ画面を開くときはステップ1に戻す
     if (targetKey === 'signup') {
@@ -928,21 +968,28 @@ export function buildUI(): void {
 
   // --- カード型ヘルパー ---
   const makeCard = (title: string): HTMLDivElement => {
+    const outerWrap = document.createElement('div');
+    outerWrap.style.cssText =
+      'width:100%;max-width:460px;position:relative;';
     const card = document.createElement('div');
-    card.style.maxWidth = '400px';
-    card.style.margin = '40px auto';
-    card.style.padding = '2rem';
-    card.style.background = '#ffffff';
-    card.style.borderRadius = '12px';
-    card.style.boxShadow = '0 10px 30px rgba(0,0,0,0.1)';
+    card.style.cssText =
+      'width:100%;padding:52px 48px 44px 48px;box-sizing:border-box;' +
+      'background:rgba(255,255,255,0.06);' +
+      'backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);' +
+      'border:1px solid rgba(255,255,255,0.1);' +
+      'border-radius:24px;' +
+      'box-shadow:0 24px 64px rgba(0,0,0,0.5)';
     const h2 = document.createElement('h2');
     h2.textContent = title;
     h2.style.textAlign = 'center';
-    h2.style.marginBottom = '1.5rem';
-    h2.style.fontSize = '20px';
-    h2.style.fontWeight = '600';
-    h2.style.color = '#333';
+    h2.style.marginBottom = '2rem';
+    h2.style.fontSize = '24px';
+    h2.style.fontWeight = '700';
+    h2.style.color = '#fff';
+    h2.style.letterSpacing = '-0.3px';
     card.appendChild(h2);
+    outerWrap.appendChild(card);
+    (card as Record<string, unknown>)['__outerWrap'] = outerWrap;
     return card;
   };
 
@@ -953,20 +1000,21 @@ export function buildUI(): void {
     lbl.textContent = label;
     lbl.style.display = 'block';
     lbl.style.marginBottom = '0.4rem';
-    lbl.style.fontWeight = '500';
-    lbl.style.fontSize = '14px';
-    lbl.style.color = '#555';
+    lbl.style.fontWeight = '600';
+    lbl.style.fontSize = '12px';
+    lbl.style.color = '#aaa';
+    lbl.style.textTransform = 'uppercase';
     input.style.width = '100%';
-    input.style.padding = '10px 14px';
-    input.style.border = '2px solid #e1e5e9';
-    input.style.borderRadius = '8px';
+    input.style.padding = '15px 20px';
+    input.style.border = 'none';
+    input.style.borderRadius = '25px';
     input.style.fontSize = '14px';
     input.style.boxSizing = 'border-box';
-    input.style.background = '#fff';
-    input.style.color = '#1f2230';
+    input.style.background = 'rgba(255,255,255,.1)';
+    input.style.color = '#fff';
     input.style.outline = 'none';
-    input.addEventListener('focus', () => { input.style.borderColor = '#0a84ff'; });
-    input.addEventListener('blur', () => { input.style.borderColor = '#e1e5e9'; });
+    input.addEventListener('focus', () => { input.style.background = 'rgba(255,255,255,.18)'; });
+    input.addEventListener('blur', () => { input.style.background = 'rgba(255,255,255,.1)'; });
     group.appendChild(lbl);
     group.appendChild(input);
     return group;
@@ -975,16 +1023,18 @@ export function buildUI(): void {
   const makePrimaryBtn = (id: string, label: string): HTMLButtonElement => {
     const btn = createButton(id, label);
     btn.style.width = '100%';
-    btn.style.padding = '12px';
-    btn.style.background = '#0a84ff';
+    btn.style.padding = '14px 20px';
+    btn.style.background = 'linear-gradient(135deg, #6c63ff 0%, #4f8ef7 100%)';
     btn.style.color = '#ffffff';
     btn.style.border = 'none';
-    btn.style.borderRadius = '8px';
+    btn.style.borderRadius = '14px';
     btn.style.fontSize = '15px';
     btn.style.fontWeight = '700';
     btn.style.cursor = 'pointer';
     btn.style.marginBottom = '0';
     btn.style.marginRight = '0';
+    btn.style.letterSpacing = '0.3px';
+    btn.style.boxShadow = '0 4px 18px rgba(108,99,255,0.4)';
     return btn;
   };
 
@@ -998,7 +1048,7 @@ export function buildUI(): void {
     btn.style.marginTop = '1rem';
     btn.style.border = 'none';
     btn.style.background = 'transparent';
-    btn.style.color = '#0a84ff';
+    btn.style.color = 'rgba(255,255,255,.6)';
     btn.style.cursor = 'pointer';
     btn.style.fontSize = '13px';
     btn.onclick = onClick;
@@ -1007,7 +1057,7 @@ export function buildUI(): void {
 
   // --- ログイン画面 ---
   const loginScreen = document.createElement('div');
-  loginScreen.style.width = '100%';
+  loginScreen.style.cssText = 'width:100%;background:linear-gradient(135deg,#13111c 0%,#1d1b31 50%,#111827 100%);display:flex;justify-content:center;align-items:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
   const loginCard = makeCard('ログイン');
 
   const numberInput = createInput('number', '番号 (例: 02-xxxxxxxx)', localStorage.getItem(LS_PHONE_NUMBER) ?? localStorage.getItem(LS_NUMBER) ?? '');
@@ -1017,8 +1067,62 @@ export function buildUI(): void {
   privateKeyInput.value = localStorage.getItem(LS_PRIVATE_KEY) ?? '';
   let privateKeyMaskTimer: number | null = null;
 
+  // --- メインセクション: 番号 + ニーモニック ---
   loginCard.appendChild(makeFormGroup('番号', numberInput));
-  loginCard.appendChild(makeFormGroup('秘密鍵', privateKeyInput));
+
+  // ニーモニック入力（メイン）
+  const mnemonicLoginGroup = document.createElement('div');
+  mnemonicLoginGroup.style.marginBottom = '1.2rem';
+  const mnemonicLoginLabel = document.createElement('label');
+  mnemonicLoginLabel.textContent = 'ニーモニック';
+  mnemonicLoginLabel.style.cssText = 'display:block;margin-bottom:0.4rem;font-weight:600;font-size:12px;color:#aaa;text-transform:uppercase';
+  const mnemonicLoginTextarea = document.createElement('textarea');
+  mnemonicLoginTextarea.id = 'mnemonicLogin';
+  mnemonicLoginTextarea.placeholder = '24語のニーモニックをスペース区切りで入力…';
+  mnemonicLoginTextarea.rows = 3;
+  mnemonicLoginTextarea.style.cssText = 'width:100%;box-sizing:border-box;border:none;border-radius:15px;padding:12px 16px;font-size:13px;font-family:monospace;resize:vertical;background:rgba(255,255,255,.1);color:#fff;outline:none';
+  mnemonicLoginTextarea.addEventListener('focus', () => { mnemonicLoginTextarea.style.background = 'rgba(255,255,255,.18)'; });
+  mnemonicLoginTextarea.addEventListener('blur', () => { mnemonicLoginTextarea.style.background = 'rgba(255,255,255,.1)'; });
+  mnemonicLoginGroup.appendChild(mnemonicLoginLabel);
+  mnemonicLoginGroup.appendChild(mnemonicLoginTextarea);
+  loginCard.appendChild(mnemonicLoginGroup);
+
+  // 端末に保存
+  const persistSensitiveLabel = document.createElement('label');
+  persistSensitiveLabel.style.display = 'inline-flex';
+  persistSensitiveLabel.style.alignItems = 'center';
+  persistSensitiveLabel.style.gap = '6px';
+  persistSensitiveLabel.style.fontSize = '12px';
+  persistSensitiveLabel.style.color = 'rgba(255,255,255,.7)';
+  persistSensitiveLabel.style.marginBottom = '1.2rem';
+  const persistSensitiveCheck = document.createElement('input');
+  persistSensitiveCheck.type = 'checkbox';
+  persistSensitiveCheck.checked = (localStorage.getItem(LS_PERSIST_SENSITIVE) ?? '1') !== '0';
+  const persistSensitiveText = document.createElement('span');
+  persistSensitiveText.textContent = '端末に保存';
+  persistSensitiveLabel.appendChild(persistSensitiveCheck);
+  persistSensitiveLabel.appendChild(persistSensitiveText);
+  loginCard.appendChild(persistSensitiveLabel);
+
+  const btnLookupConnect = makePrimaryBtn('btnLookupConnect', 'ログイン');
+  loginCard.appendChild(btnLookupConnect);
+
+  // HR 区切り線
+  const loginHr = document.createElement('div');
+  loginHr.style.cssText = 'height:2px;margin:30px 0 20px 0;background:rgba(255,255,255,.2)';
+  loginCard.appendChild(loginHr);
+
+  // --- サブセクション: 秘密鍵で直接ログイン（折りたたみ）---
+  const privateKeyToggle = document.createElement('button');
+  privateKeyToggle.type = 'button';
+  privateKeyToggle.textContent = '▶ 秘密鍵で直接ログインする';
+  privateKeyToggle.style.cssText = 'border:none;background:transparent;color:rgba(255,255,255,.7);cursor:pointer;font-size:13px;padding:0;margin-bottom:0.5rem;text-align:left;width:100%';
+
+  const privateKeySection = document.createElement('div');
+  privateKeySection.style.display = 'none';
+  privateKeySection.style.marginBottom = '1rem';
+
+  privateKeySection.appendChild(makeFormGroup('秘密鍵', privateKeyInput));
 
   const privateKeyControl = document.createElement('div');
   privateKeyControl.style.marginBottom = '1rem';
@@ -1031,7 +1135,7 @@ export function buildUI(): void {
   btnTogglePrivateKey.textContent = '秘密鍵を表示';
   btnTogglePrivateKey.style.border = 'none';
   btnTogglePrivateKey.style.background = 'transparent';
-  btnTogglePrivateKey.style.color = '#0a84ff';
+  btnTogglePrivateKey.style.color = 'rgba(255,255,255,.7)';
   btnTogglePrivateKey.style.cursor = 'pointer';
   btnTogglePrivateKey.style.fontSize = '13px';
   btnTogglePrivateKey.style.padding = '0';
@@ -1049,73 +1153,26 @@ export function buildUI(): void {
       btnTogglePrivateKey.textContent = '秘密鍵を表示';
     }, 5000);
   });
-
-  const persistSensitiveLabel = document.createElement('label');
-  persistSensitiveLabel.style.display = 'inline-flex';
-  persistSensitiveLabel.style.alignItems = 'center';
-  persistSensitiveLabel.style.gap = '6px';
-  persistSensitiveLabel.style.fontSize = '12px';
-  persistSensitiveLabel.style.color = '#666';
-  const persistSensitiveCheck = document.createElement('input');
-  persistSensitiveCheck.type = 'checkbox';
-  persistSensitiveCheck.checked = (localStorage.getItem(LS_PERSIST_SENSITIVE) ?? '1') !== '0';
-  const persistSensitiveText = document.createElement('span');
-  persistSensitiveText.textContent = '端末に保存';
-  persistSensitiveLabel.appendChild(persistSensitiveCheck);
-  persistSensitiveLabel.appendChild(persistSensitiveText);
-
   privateKeyControl.appendChild(btnTogglePrivateKey);
-  privateKeyControl.appendChild(persistSensitiveLabel);
-  loginCard.appendChild(privateKeyControl);
+  privateKeySection.appendChild(privateKeyControl);
 
-  // ログイン画面 – ニーモニック復元セクション
-  const mnemonicRestoreToggle = document.createElement('button');
-  mnemonicRestoreToggle.type = 'button';
-  mnemonicRestoreToggle.textContent = '▶ ニーモニックから秘密鍵を復元する';
-  mnemonicRestoreToggle.style.cssText = 'border:none;background:transparent;color:#0a84ff;cursor:pointer;font-size:13px;padding:0;margin-bottom:0.5rem;text-align:left;width:100%';
-  const mnemonicRestoreSection = document.createElement('div');
-  mnemonicRestoreSection.style.display = 'none';
-  mnemonicRestoreSection.style.marginBottom = '1rem';
-  const mnemonicRestoreTextarea = document.createElement('textarea');
-  mnemonicRestoreTextarea.placeholder = '24語のニーモニックをスペース区切りで入力…';
-  mnemonicRestoreTextarea.rows = 3;
-  mnemonicRestoreTextarea.style.cssText = 'width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:8px;padding:8px;font-size:13px;font-family:monospace;resize:vertical;margin-bottom:6px';
-  const btnApplyMnemonic = document.createElement('button');
-  btnApplyMnemonic.type = 'button';
-  btnApplyMnemonic.textContent = 'ニーモニックを適用';
-  btnApplyMnemonic.style.cssText = 'border:none;background:#0a84ff;color:#fff;border-radius:8px;padding:6px 14px;cursor:pointer;font-size:13px';
-  btnApplyMnemonic.onclick = async () => {
-    try {
-      const hex = await mnemonicToPrivateKeyHex(mnemonicRestoreTextarea.value);
-      privateKeyInput.value = hex;
-      privateKeyInput.type = 'text';
-      btnTogglePrivateKey.textContent = '秘密鍵を隠す';
-      setStatus('ニーモニックから秘密鍵を復元しました。ログインしてください。');
-    } catch (err) {
-      setErrorStatus(err);
-    }
+  privateKeyToggle.onclick = () => {
+    const shown = privateKeySection.style.display !== 'none';
+    privateKeySection.style.display = shown ? 'none' : 'block';
+    privateKeyToggle.textContent = shown
+      ? '▶ 秘密鍵で直接ログインする'
+      : '▼ 秘密鍵で直接ログインする';
   };
-  mnemonicRestoreSection.appendChild(mnemonicRestoreTextarea);
-  mnemonicRestoreSection.appendChild(btnApplyMnemonic);
-  mnemonicRestoreToggle.onclick = () => {
-    const shown = mnemonicRestoreSection.style.display !== 'none';
-    mnemonicRestoreSection.style.display = shown ? 'none' : 'block';
-    mnemonicRestoreToggle.textContent = shown
-      ? '▶ ニーモニックから秘密鍵を復元する'
-      : '▼ ニーモニックから秘密鍵を復元する';
-  };
-  loginCard.appendChild(mnemonicRestoreToggle);
-  loginCard.appendChild(mnemonicRestoreSection);
+  loginCard.appendChild(privateKeyToggle);
+  loginCard.appendChild(privateKeySection);
 
-  const btnLookupConnect = makePrimaryBtn('btnLookupConnect', 'ログイン');
-  loginCard.appendChild(btnLookupConnect);
   loginCard.appendChild(makeLinkBtn('新規登録はこちら', () => setActiveScreen('signup')));
   loginCard.appendChild(makeLinkBtn('パスワードを忘れた方', () => setActiveScreen('reset')));
-  loginScreen.appendChild(loginCard);
+  loginScreen.appendChild((loginCard as Record<string, unknown>)['__outerWrap'] as HTMLElement ?? loginCard);
 
   // --- 新規登録画面 ---
   const signupScreen = document.createElement('div');
-  signupScreen.style.width = '100%';
+  signupScreen.style.cssText = 'width:100%;background:linear-gradient(135deg,#13111c 0%,#1d1b31 50%,#111827 100%);display:flex;justify-content:center;align-items:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
   const signupCard = makeCard('新規登録');
 
   const signupRouteInput = createInput('signupRoute', 'ルーティング番号（2桁、例: 02）');
@@ -1138,17 +1195,17 @@ export function buildUI(): void {
     '新しい秘密鍵を自動生成しました。<br>' +
     '<strong>以下の24語のニーモニックを紙などに控えてください。</strong><br>' +
     'このニーモニックがないと秘密鍵を復元できません。';
-  signupStep2Note.style.cssText = 'margin:0 0 0.8rem 0;font-size:13px;color:#333;line-height:1.5';
+  signupStep2Note.style.cssText = 'margin:0 0 0.8rem 0;font-size:13px;color:#ddd;line-height:1.5';
   signupStep2.appendChild(signupStep2Note);
   signupStep2.appendChild(makeFormGroup('トークン', signupTokenInput));
 
   // ニーモニック表示グリッド
   const signupMnemonicGrid = document.createElement('div');
   signupMnemonicGrid.style.cssText =
-    'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 0.6rem 0;background:#f4f6fb;border-radius:10px;padding:10px';
+    'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 0.6rem 0;background:rgba(255,255,255,0.05);border-radius:14px;padding:12px;border:1px solid rgba(255,255,255,0.08)';
   const signupMnemonicStatus = document.createElement('p');
   signupMnemonicStatus.textContent = '生成中…';
-  signupMnemonicStatus.style.cssText = 'font-size:12px;color:#888;margin:0 0 0.5rem 0;text-align:center';
+  signupMnemonicStatus.style.cssText = 'font-size:12px;color:rgba(255,255,255,.6);margin:0 0 0.5rem 0;text-align:center';
   signupStep2.appendChild(signupMnemonicGrid);
   signupStep2.appendChild(signupMnemonicStatus);
 
@@ -1157,7 +1214,7 @@ export function buildUI(): void {
   btnSignupCopyMnemonic.type = 'button';
   btnSignupCopyMnemonic.textContent = 'ニーモニックをコピー';
   btnSignupCopyMnemonic.style.cssText =
-    'border:1px solid #0a84ff;background:transparent;color:#0a84ff;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px;margin-right:8px';
+    'border:1px solid rgba(255,255,255,.5);background:transparent;color:rgba(255,255,255,.8);border-radius:25px;padding:6px 14px;cursor:pointer;font-size:13px;margin-right:8px';
   btnSignupCopyMnemonic.onclick = () => {
     navigator.clipboard.writeText(signupMnemonicGrid.dataset['mnemonic'] ?? '').then(() => {
       btnSignupCopyMnemonic.textContent = 'コピー済み ✓';
@@ -1170,7 +1227,7 @@ export function buildUI(): void {
   btnSignupRegen.type = 'button';
   btnSignupRegen.textContent = '再生成';
   btnSignupRegen.style.cssText =
-    'border:1px solid #888;background:transparent;color:#555;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px';
+    'border:1px solid rgba(255,255,255,.3);background:transparent;color:rgba(255,255,255,.6);border-radius:25px;padding:6px 14px;cursor:pointer;font-size:13px';
   btnSignupRegen.onclick = () => {
     generateAndShowMnemonic(
       signupMnemonicGrid, signupMnemonicStatus,
@@ -1187,7 +1244,7 @@ export function buildUI(): void {
 
   // 確認チェックボックス
   const signupConfirmLabel = document.createElement('label');
-  signupConfirmLabel.style.cssText = 'display:flex;align-items:flex-start;gap:6px;font-size:13px;color:#333;margin-bottom:1rem;cursor:pointer';
+  signupConfirmLabel.style.cssText = 'display:flex;align-items:flex-start;gap:6px;font-size:13px;color:#ddd;margin-bottom:1rem;cursor:pointer';
   const signupConfirmCheck = document.createElement('input');
   signupConfirmCheck.type = 'checkbox';
   signupConfirmCheck.style.marginTop = '2px';
@@ -1211,11 +1268,11 @@ export function buildUI(): void {
   signupButtonWrap.appendChild(btnCreate);
   signupCard.appendChild(signupButtonWrap);
   signupCard.appendChild(makeLinkBtn('すでにアカウントをお持ちの方', () => setActiveScreen('login')));
-  signupScreen.appendChild(signupCard);
+  signupScreen.appendChild((signupCard as Record<string, unknown>)['__outerWrap'] as HTMLElement ?? signupCard);
 
   // --- 再設定画面 ---
   const resetScreen = document.createElement('div');
-  resetScreen.style.width = '100%';
+  resetScreen.style.cssText = 'width:100%;background:linear-gradient(135deg,#13111c 0%,#1d1b31 50%,#111827 100%);display:flex;justify-content:center;align-items:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
   const resetCard = makeCard('秘密鍵の再設定');
 
   const resetRouteInput = createInput('resetRoute', 'ルーティング番号（2桁、例: 02）');
@@ -1238,16 +1295,16 @@ export function buildUI(): void {
     '新しい秘密鍵を自動生成しました。<br>' +
     '<strong>以下の24語のニーモニックを紙などに控えてください。</strong><br>' +
     'このニーモニックがないと秘密鍵を復元できません。';
-  resetStep2Note.style.cssText = 'margin:0 0 0.8rem 0;font-size:13px;color:#333;line-height:1.5';
+  resetStep2Note.style.cssText = 'margin:0 0 0.8rem 0;font-size:13px;color:#ddd;line-height:1.5';
   resetStep2.appendChild(resetStep2Note);
   resetStep2.appendChild(makeFormGroup('トークン', resetTokenInput));
 
   const resetMnemonicGrid = document.createElement('div');
   resetMnemonicGrid.style.cssText =
-    'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 0.6rem 0;background:#f4f6fb;border-radius:10px;padding:10px';
+    'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 0.6rem 0;background:rgba(255,255,255,0.05);border-radius:14px;padding:12px;border:1px solid rgba(255,255,255,0.08)';
   const resetMnemonicStatus = document.createElement('p');
   resetMnemonicStatus.textContent = '生成中…';
-  resetMnemonicStatus.style.cssText = 'font-size:12px;color:#888;margin:0 0 0.5rem 0;text-align:center';
+  resetMnemonicStatus.style.cssText = 'font-size:12px;color:rgba(255,255,255,.6);margin:0 0 0.5rem 0;text-align:center';
   resetStep2.appendChild(resetMnemonicGrid);
   resetStep2.appendChild(resetMnemonicStatus);
 
@@ -1255,7 +1312,7 @@ export function buildUI(): void {
   btnResetCopyMnemonic.type = 'button';
   btnResetCopyMnemonic.textContent = 'ニーモニックをコピー';
   btnResetCopyMnemonic.style.cssText =
-    'border:1px solid #0a84ff;background:transparent;color:#0a84ff;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px;margin-right:8px';
+    'border:1px solid rgba(255,255,255,.5);background:transparent;color:rgba(255,255,255,.8);border-radius:25px;padding:6px 14px;cursor:pointer;font-size:13px;margin-right:8px';
   btnResetCopyMnemonic.onclick = () => {
     navigator.clipboard.writeText(resetMnemonicGrid.dataset['mnemonic'] ?? '').then(() => {
       btnResetCopyMnemonic.textContent = 'コピー済み ✓';
@@ -1267,7 +1324,7 @@ export function buildUI(): void {
   btnResetRegen.type = 'button';
   btnResetRegen.textContent = '再生成';
   btnResetRegen.style.cssText =
-    'border:1px solid #888;background:transparent;color:#555;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px';
+    'border:1px solid rgba(255,255,255,.3);background:transparent;color:rgba(255,255,255,.6);border-radius:25px;padding:6px 14px;cursor:pointer;font-size:13px';
   btnResetRegen.onclick = () => {
     generateAndShowMnemonic(
       resetMnemonicGrid, resetMnemonicStatus,
@@ -1283,7 +1340,7 @@ export function buildUI(): void {
   resetStep2.appendChild(resetBtnRow);
 
   const resetConfirmLabel = document.createElement('label');
-  resetConfirmLabel.style.cssText = 'display:flex;align-items:flex-start;gap:6px;font-size:13px;color:#333;margin-bottom:1rem;cursor:pointer';
+  resetConfirmLabel.style.cssText = 'display:flex;align-items:flex-start;gap:6px;font-size:13px;color:#ddd;margin-bottom:1rem;cursor:pointer';
   const resetConfirmCheck = document.createElement('input');
   resetConfirmCheck.type = 'checkbox';
   resetConfirmCheck.style.marginTop = '2px';
@@ -1307,7 +1364,7 @@ export function buildUI(): void {
   resetButtonWrap.appendChild(btnResetDo);
   resetCard.appendChild(resetButtonWrap);
   resetCard.appendChild(makeLinkBtn('ログインに戻る', () => setActiveScreen('login')));
-  resetScreen.appendChild(resetCard);
+  resetScreen.appendChild((resetCard as Record<string, unknown>)['__outerWrap'] as HTMLElement ?? resetCard);
 
   const chatScreen = createSection('会話画面');
   chatScreen.style.background = 'transparent';
@@ -1342,7 +1399,8 @@ export function buildUI(): void {
 
   const threadsPane = document.createElement('div');
   threadsPane.style.background = '#ffffff';
-  threadsPane.style.border = '1px solid #e3e6ef';
+  threadsPane.style.border = 'none';
+  threadsPane.style.borderRight = '1px solid #eef0f8';
   threadsPane.style.borderRadius = '0';
   threadsPane.style.padding = '0';
   threadsPane.style.minHeight = '0';
@@ -1351,8 +1409,8 @@ export function buildUI(): void {
   threadsPane.style.flexDirection = 'column';
 
   const conversationPane = document.createElement('div');
-  conversationPane.style.background = '#ffffff';
-  conversationPane.style.border = '1px solid #e3e6ef';
+  conversationPane.style.background = '#f5f7ff';
+  conversationPane.style.border = 'none';
   conversationPane.style.borderRadius = '0';
   conversationPane.style.padding = '0';
   conversationPane.style.minHeight = '0';
@@ -1416,8 +1474,8 @@ export function buildUI(): void {
   chatHeader.style.display = 'grid';
   chatHeader.style.gap = '8px';
   chatHeader.style.marginBottom = '0';
-  chatHeader.style.padding = '8px 10px';
-  chatHeader.style.borderBottom = '1px solid #e3e6ef';
+  chatHeader.style.padding = '12px 14px';
+  chatHeader.style.borderBottom = '1px solid #eef0f8';
 
   const threadHeaderRow = document.createElement('div');
   threadHeaderRow.style.display = 'flex';
@@ -1427,23 +1485,24 @@ export function buildUI(): void {
 
   const threadHeaderTitle = document.createElement('div');
   threadHeaderTitle.textContent = 'メッセージ';
-  threadHeaderTitle.style.fontSize = '13px';
+  threadHeaderTitle.style.fontSize = '14px';
   threadHeaderTitle.style.fontWeight = '700';
-  threadHeaderTitle.style.color = '#2b3550';
+  threadHeaderTitle.style.color = '#1a1a2e';
 
   const btnCreateThread = document.createElement('button');
   btnCreateThread.type = 'button';
   btnCreateThread.textContent = '+';
   btnCreateThread.title = '新規作成';
-  btnCreateThread.style.width = '28px';
-  btnCreateThread.style.height = '28px';
+  btnCreateThread.style.width = '30px';
+  btnCreateThread.style.height = '30px';
   btnCreateThread.style.borderRadius = '999px';
-  btnCreateThread.style.border = '1px solid #d6dceb';
-  btnCreateThread.style.background = '#ffffff';
-  btnCreateThread.style.color = '#2b3550';
+  btnCreateThread.style.border = 'none';
+  btnCreateThread.style.background = 'linear-gradient(135deg,#6c63ff,#4f8ef7)';
+  btnCreateThread.style.color = '#ffffff';
   btnCreateThread.style.fontSize = '18px';
   btnCreateThread.style.lineHeight = '1';
   btnCreateThread.style.cursor = 'pointer';
+  btnCreateThread.style.boxShadow = '0 2px 8px rgba(108,99,255,0.35)';
 
   threadHeaderRow.appendChild(threadHeaderTitle);
   threadHeaderRow.appendChild(btnCreateThread);
@@ -1460,42 +1519,44 @@ export function buildUI(): void {
   chatTopBar.style.display = 'flex';
   chatTopBar.style.alignItems = 'center';
   chatTopBar.style.gap = '10px';
-  chatTopBar.style.padding = '4px 0';
+  chatTopBar.style.padding = '10px 14px';
   chatTopBar.style.background = '#ffffff';
   chatTopBar.style.border = 'none';
-  chatTopBar.style.borderBottom = '1px solid #e3e6ef';
+  chatTopBar.style.borderBottom = '1px solid #eef0f8';
   chatTopBar.style.borderRadius = '0';
   chatTopBar.style.marginBottom = '0';
 
   const avatar = document.createElement('div');
   avatar.textContent = '●';
-  avatar.style.width = '26px';
-  avatar.style.height = '26px';
+  avatar.style.width = '32px';
+  avatar.style.height = '32px';
   avatar.style.borderRadius = '999px';
   avatar.style.display = 'grid';
   avatar.style.placeItems = 'center';
-  avatar.style.background = '#d9e9ff';
-  avatar.style.color = '#0a84ff';
+  avatar.style.background = 'linear-gradient(135deg,#6c63ff,#4f8ef7)';
+  avatar.style.color = '#ffffff';
   avatar.style.fontSize = '10px';
+  avatar.style.flexShrink = '0';
 
   const chatPeerLabel = document.createElement('div');
-  chatPeerLabel.style.fontSize = '13px';
+  chatPeerLabel.style.fontSize = '14px';
   chatPeerLabel.style.fontWeight = '700';
-  chatPeerLabel.style.color = '#2b3550';
+  chatPeerLabel.style.color = '#1a1a2e';
   chatPeerLabel.textContent = '宛先未設定';
 
   const peerNameInput = createInput('peerName', '番号の表示名');
   peerNameInput.style.maxWidth = '220px';
   peerNameInput.style.marginLeft = 'auto';
 
-  const btnHeaderCall = createButton('btnHeaderCall', '通話');
+  const btnHeaderCall = createButton('btnHeaderCall', '📞');
   btnHeaderCall.style.marginRight = '0';
   btnHeaderCall.style.marginBottom = '0';
-  btnHeaderCall.style.borderRadius = '10px';
-  btnHeaderCall.style.padding = '6px 10px';
-  btnHeaderCall.style.background = '#0a84ff';
+  btnHeaderCall.style.borderRadius = '12px';
+  btnHeaderCall.style.padding = '6px 12px';
+  btnHeaderCall.style.background = 'linear-gradient(135deg,#6c63ff,#4f8ef7)';
   btnHeaderCall.style.color = '#ffffff';
   btnHeaderCall.style.border = 'none';
+  btnHeaderCall.style.boxShadow = '0 2px 8px rgba(108,99,255,0.3)';
 
   const btnMobileBack = createButton('btnMobileBack', '←');
   btnMobileBack.style.marginRight = '0';
@@ -1523,22 +1584,26 @@ export function buildUI(): void {
   composerWrap.style.gap = '8px';
   composerWrap.style.alignItems = 'end';
   composerWrap.style.marginTop = '0';
-  composerWrap.style.padding = '4px 0';
+  composerWrap.style.padding = '10px 14px';
   composerWrap.style.background = '#ffffff';
   composerWrap.style.border = 'none';
-  composerWrap.style.borderTop = '1px solid #e3e6ef';
+  composerWrap.style.borderTop = '1px solid #eef0f8';
   composerWrap.style.borderRadius = '0';
   composerWrap.style.position = 'sticky';
   composerWrap.style.bottom = '0';
 
-  const btnSendSMS = createButton('btnSendSMS', '送信');
+  const btnSendSMS = createButton('btnSendSMS', '↑');
   btnSendSMS.style.marginRight = '0';
   btnSendSMS.style.marginBottom = '0';
-  btnSendSMS.style.background = '#0a84ff';
+  btnSendSMS.style.background = 'linear-gradient(135deg,#6c63ff,#4f8ef7)';
   btnSendSMS.style.color = '#ffffff';
   btnSendSMS.style.border = 'none';
-  btnSendSMS.style.borderRadius = '14px';
-  btnSendSMS.style.padding = '8px 14px';
+  btnSendSMS.style.borderRadius = '999px';
+  btnSendSMS.style.width = '38px';
+  btnSendSMS.style.height = '38px';
+  btnSendSMS.style.padding = '0';
+  btnSendSMS.style.fontSize = '18px';
+  btnSendSMS.style.boxShadow = '0 2px 8px rgba(108,99,255,0.4)';
 
   const sendHistoryTitle = document.createElement('h3');
   sendHistoryTitle.textContent = '';
@@ -1560,10 +1625,10 @@ export function buildUI(): void {
   messageFeedNode.style.flexDirection = 'column';
   messageFeedNode.style.gap = '6px';
   messageFeedNode.style.overflowY = 'auto';
-  messageFeedNode.style.padding = '10px 0';
+  messageFeedNode.style.padding = '10px 14px';
   messageFeedNode.style.border = 'none';
   messageFeedNode.style.borderRadius = '0';
-  messageFeedNode.style.background = '#ffffff';
+  messageFeedNode.style.background = '#f5f7ff';
   messageFeedNode.style.minHeight = '0';
   messageFeedNode.style.flex = '1';
   conversationPane.appendChild(messageFeedNode);
@@ -1780,22 +1845,23 @@ export function buildUI(): void {
       row.type = 'button';
       row.style.textAlign = 'left';
       row.style.border = 'none';
-      row.style.borderBottom = '1px solid #e3e6ef';
+      row.style.borderBottom = '1px solid #f0f2fa';
+      row.style.borderLeft = peer === activeThreadNumber ? '3px solid #6c63ff' : '3px solid transparent';
       row.style.borderRadius = '0';
-      row.style.padding = '12px 8px';
-      row.style.background = peer === activeThreadNumber ? '#e9f3ff' : 'transparent';
+      row.style.padding = '13px 14px';
+      row.style.background = peer === activeThreadNumber ? '#f0eeff' : 'transparent';
       row.style.cursor = 'pointer';
 
       const head = document.createElement('div');
-      head.style.fontSize = '12px';
+      head.style.fontSize = '13px';
       head.style.fontWeight = '700';
-      head.style.color = '#2b3550';
+      head.style.color = '#1a1a2e';
       head.textContent = getDisplayName(peer);
 
       const preview = document.createElement('div');
       preview.style.marginTop = '3px';
       preview.style.fontSize = '11px';
-      preview.style.color = '#5e6880';
+      preview.style.color = '#7a82a0';
       preview.textContent = latest.body.slice(0, 36);
 
       row.appendChild(head);
@@ -1816,7 +1882,13 @@ export function buildUI(): void {
       delete contactNames[key];
     }
     if (!currentNumber) return;
-    const rec = await loadThread(currentNumber);
+    let rec: ChatThreadRecord | null = null;
+    try {
+      rec = await loadThread(currentNumber);
+    } catch {
+      // IndexedDB が利用できない環境ではチャット履歴なしで続行する
+      return;
+    }
     if (!rec) return;
     try {
       for (const it of rec.items ?? []) {
@@ -1884,11 +1956,11 @@ export function buildUI(): void {
 
       const bubble = document.createElement('div');
       bubble.style.maxWidth = '78%';
-      bubble.style.padding = '8px 12px';
+      bubble.style.padding = '9px 14px';
       bubble.style.borderRadius = msg.direction === 'out' ? '18px 18px 6px 18px' : '18px 18px 18px 6px';
-      bubble.style.background = msg.direction === 'out' ? '#0a84ff' : '#ffffff';
+      bubble.style.background = msg.direction === 'out' ? 'linear-gradient(135deg,#6c63ff,#4f8ef7)' : '#ffffff';
       bubble.style.color = msg.direction === 'out' ? '#ffffff' : '#1f2940';
-      bubble.style.boxShadow = msg.direction === 'out' ? '0 2px 8px rgba(10, 132, 255, 0.25)' : '0 2px 8px rgba(0,0,0,0.08)';
+      bubble.style.boxShadow = msg.direction === 'out' ? '0 3px 12px rgba(108,99,255,0.35)' : '0 2px 8px rgba(0,0,0,0.07)';
 
       const bodyNode = document.createElement('div');
       bodyNode.style.fontSize = '14px';
@@ -1997,16 +2069,17 @@ export function buildUI(): void {
   disconnectXButton.style.position = 'fixed';
   disconnectXButton.style.top = '14px';
   disconnectXButton.style.right = '14px';
-  disconnectXButton.style.width = '34px';
-  disconnectXButton.style.height = '34px';
+  disconnectXButton.style.width = '36px';
+  disconnectXButton.style.height = '36px';
   disconnectXButton.style.border = 'none';
   disconnectXButton.style.borderRadius = '999px';
-  disconnectXButton.style.background = '#2b2f45';
-  disconnectXButton.style.color = '#ffffff';
+  disconnectXButton.style.background = 'rgba(108,99,255,0.15)';
+  disconnectXButton.style.color = '#6c63ff';
   disconnectXButton.style.cursor = 'pointer';
   disconnectXButton.style.fontSize = '20px';
   disconnectXButton.style.lineHeight = '1';
   disconnectXButton.style.display = 'none';
+  disconnectXButton.style.backdropFilter = 'blur(8px)';
   disconnectXButton.onclick = () => {
     closeNodeWS();
     currentChallenge = '';
@@ -2020,13 +2093,23 @@ export function buildUI(): void {
   syncAuthUI();
   setActiveScreen('login');
 
+  let isLoggingIn = false;
   const doLogin = async (opts?: { silent?: boolean }): Promise<void> => {
+    if (isLoggingIn) throw new Error('ログイン処理中です。完了をお待ちください');
+    isLoggingIn = true;
+    try {
     currentNumber = numberInput.value.trim();
-    const privateKeyHex = normalizePrivateKeyHex(privateKeyInput.value);
+    const mnemonicValue = mnemonicLoginTextarea.value.trim();
+    const privateKeyHex = mnemonicValue
+      ? await mnemonicToPrivateKeyHex(mnemonicValue)
+      : normalizePrivateKeyHex(privateKeyInput.value);
 
     if (!currentNumber) {
       throw new Error('number は必須');
     }
+
+    // セッション中のみメモリに保持（persist=offでも通話認証・SMS署名で使用）
+    currentPrivateKeyHex = privateKeyHex;
 
     localStorage.setItem(LS_PERSIST_SENSITIVE, persistSensitiveCheck.checked ? '1' : '0');
     if (persistSensitiveCheck.checked) {
@@ -2080,13 +2163,20 @@ export function buildUI(): void {
 
     if (!opts?.silent) setStatus(`ログイン成功: ${currentNumber}`);
     setActiveScreen('chat');
+    } finally {
+      isLoggingIn = false;
+    }
   };
 
   btnLookupConnect.onclick = async () => {
+    if (btnLookupConnect.disabled) return;
+    btnLookupConnect.disabled = true;
     try {
       await doLogin();
     } catch (err) {
       setErrorStatus(err);
+    } finally {
+      btnLookupConnect.disabled = false;
     }
   };
 
@@ -2201,6 +2291,9 @@ export function buildUI(): void {
   };
 
   btnSendSMS.onclick = async () => {
+    if (btnSendSMS.disabled) return;
+    btnSendSMS.disabled = true;
+    let pendingId = '';
     try {
       ensureAuthenticated();
       const to = smsToInput.value.trim();
@@ -2211,12 +2304,15 @@ export function buildUI(): void {
       if (!to) throw new Error('to is required');
       if (!from) throw new Error('from is required');
       if (!body) throw new Error('message is required');
-      const privateKeyHex = normalizePrivateKeyHex((privateKeyInput.value || localStorage.getItem(LS_PRIVATE_KEY)) ?? '');
+      // セッション変数を優先。persist=offや入力欄クリア後でも署名できる
+      const privateKeyHex =
+        currentPrivateKeyHex ||
+        normalizePrivateKeyHex((privateKeyInput.value || localStorage.getItem(LS_PRIVATE_KEY)) ?? '');
       const sig = makeMessageSignatureHex(from, to, { body }, timestamp, privateKeyHex);
 
-      const id = crypto.randomUUID();
+      pendingId = crypto.randomUUID();
       chatItems.push({
-        id,
+        id: pendingId,
         from,
         to,
         body,
@@ -2230,7 +2326,7 @@ export function buildUI(): void {
       persistThread();
 
       await sendSMS(windowBase, to, from, body, sig, timestamp);
-      const target = chatItems.find((x) => x.id === id);
+      const target = chatItems.find((x) => x.id === pendingId);
       if (target) target.status = 'sent';
       renderChatItems();
       renderThreadList();
@@ -2238,15 +2334,17 @@ export function buildUI(): void {
       setStatus('sms sent');
       smsBody.value = '';
     } catch (err) {
-      const latest = chatItems.find((x) => x.status === 'sending');
-      if (latest) {
-        latest.status = 'failed';
-        latest.reason = toErrorText(err);
+      const failed = pendingId ? chatItems.find((x) => x.id === pendingId) : null;
+      if (failed) {
+        failed.status = 'failed';
+        failed.reason = toErrorText(err);
         renderChatItems();
         renderThreadList();
         persistThread();
       }
       setErrorStatus(err);
+    } finally {
+      btnSendSMS.disabled = false;
     }
   };
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	crand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -24,6 +25,7 @@ var upgrader = websocket.Upgrader{
 var dbServiceURL string
 var dbServiceToken string
 var seedDomain string
+var routeNumber string // このwindowサーバーのルーティングプレフィックス（例: "02"）
 var dbWSConn *websocket.Conn
 var dbWSMu sync.Mutex
 
@@ -98,6 +100,20 @@ func getTokenEmail(store map[string]tokenEntry, token string) (string, bool) {
 	if time.Now().After(entry.ExpiresAt) {
 		return "", false
 	}
+	return entry.Email, true
+}
+
+// atomicConsumeToken はトークンの有効性チェックと削除を書き込みロック下でアトミックに行う。
+// RLock → Unlock → Lock の TOCTOU 競合を防ぎ、同一トークンの並行使用を排除する。
+func atomicConsumeToken(store map[string]tokenEntry, token string) (string, bool) {
+	tokensMu.Lock()
+	defer tokensMu.Unlock()
+	entry, ok := store[token]
+	if !ok || time.Now().After(entry.ExpiresAt) {
+		delete(store, token) // 期限切れも即削除
+		return "", false
+	}
+	delete(store, token)
 	return entry.Email, true
 }
 
@@ -227,7 +243,7 @@ func createUser(email string, pubkey string) (number string, err error) {
 	var out struct {
 		Number string `json:"number"`
 	}
-	err = dbWSCall("users.create", map[string]string{"email": email, "public_key": pubkey}, &out)
+	err = dbWSCall("users.create", map[string]string{"email": email, "public_key": pubkey, "route": routeNumber}, &out)
 	if err != nil {
 		return "", err
 	}
@@ -264,10 +280,91 @@ func sendEmail(to, subject, body string) error {
 	user := os.Getenv("SMTP_USER")
 	password := os.Getenv("SMTP_PASSWORD")
 
+	// SMTP ヘッダーインジェクション対策: to / subject の改行文字を除去する
+	to = strings.NewReplacer("\r", "", "\n", "").Replace(to)
+	subject = strings.NewReplacer("\r", "", "\n", "").Replace(subject)
+
 	auth := smtp.PlainAuth("", user, password, host)
 	msg := fmt.Sprintf("From: %s\nTo: %s\nSubject: %s\n\n%s", user, to, subject, body)
 	err := smtp.SendMail(host+":"+port, auth, user, []string{to}, []byte(msg))
 	return err
+}
+
+// --- CORS ---
+
+// corsMiddleware はすべてのHTTPレスポンスにCORSヘッダーを付与する。
+// ブラウザからのfetchリクエストがCORSポリシーでブロックされないようにする。
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+		} else {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Request-ID")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// --- メッセージ型・署名検証 ---
+
+// Message はSMSメッセージの構造体。node/main.go と同一定義。
+type Message struct {
+	Timestamp int64           `json:"timestamp"`
+	Message   json.RawMessage `json:"message"`
+	To        string          `json:"to"`
+	From      string          `json:"from"`
+	Sig       string          `json:"sig"`
+}
+
+func buildMessageSigningPayload(msg *Message) map[string]any {
+	return map[string]any{
+		"timestamp": msg.Timestamp,
+		"message":   json.RawMessage(msg.Message),
+		"to":        msg.To,
+		"from":      msg.From,
+	}
+}
+
+// verifyMessageSignature はSMSメッセージの署名をwindow側で検証する。
+// DBから送信者の公開鍵を取得してECDSA検証を行う。
+func verifyMessageSignature(msg *Message) error {
+	if msg.From == "" || msg.To == "" || len(msg.Message) == 0 || msg.Timestamp == 0 || msg.Sig == "" {
+		return fmt.Errorf("missing signed fields")
+	}
+	_, pubHex, err := getUserByNumber(msg.From)
+	if err != nil {
+		return fmt.Errorf("sender not found: %w", err)
+	}
+	pubBytes, err := hex.DecodeString(pubHex)
+	if err != nil || len(pubBytes) != 64 {
+		return fmt.Errorf("invalid public key encoding")
+	}
+	sigBytes, err := hex.DecodeString(msg.Sig)
+	if err != nil || len(sigBytes) != 96 {
+		return fmt.Errorf("invalid signature encoding")
+	}
+	payload := buildMessageSigningPayload(msg)
+	normalized, err := CanonicalJSON(payload)
+	if err != nil {
+		return err
+	}
+	var pub PublicKey
+	copy(pub[:], pubBytes)
+	var sig Signature
+	copy(sig[:], sigBytes)
+	if !Verify(pub, normalized, sig) {
+		return fmt.Errorf("signature verify failed")
+	}
+	return nil
 }
 
 // --- ノード管理 ---
@@ -345,6 +442,25 @@ func lookupSeed(domain, number string) ([]string, error) {
 	return records["node"], nil
 }
 
+// normalizeMeshURL はDNSレコード等から取得したノードアドレスを
+// /mesh エンドポイントの wss:// URL に正規化する。
+// 既存のスキームやパスが含まれていても正しく処理する。
+func normalizeMeshURL(addr string) string {
+	addr = strings.TrimSpace(addr)
+	// スキームがあれば除去
+	for _, pfx := range []string{"wss://", "ws://", "https://", "http://"} {
+		if strings.HasPrefix(addr, pfx) {
+			addr = addr[len(pfx):]
+			break
+		}
+	}
+	// パスがあれば除去（ホスト:ポートだけ残す）
+	if i := strings.Index(addr, "/"); i >= 0 {
+		addr = addr[:i]
+	}
+	return "wss://" + addr + "/mesh"
+}
+
 // connectToNode はノードにWSS接続してnodesに登録する
 func connectToNode(addr string) {
 	nodesMu.Lock()
@@ -354,7 +470,8 @@ func connectToNode(addr string) {
 	}
 	nodesMu.Unlock()
 
-	conn, _, err := websocket.DefaultDialer.Dial("wss://"+addr+"/mesh", nil)
+	meshURL := normalizeMeshURL(addr)
+	conn, _, err := websocket.DefaultDialer.Dial(meshURL, nil)
 	if err != nil {
 		log.Printf("failed to connect to node %s: %v", addr, err)
 		return
@@ -362,6 +479,12 @@ func connectToNode(addr string) {
 
 	node := &NodeConn{conn: conn}
 	nodesMu.Lock()
+	// ダイヤル中に別のgoroutineが同一アドレスを先に登録していた場合は重複接続を閉じる
+	if _, exists := nodes[addr]; exists {
+		nodesMu.Unlock()
+		conn.Close()
+		return
+	}
 	nodes[addr] = node
 	nodesMu.Unlock()
 	log.Printf("connected to node: %s", addr)
@@ -371,7 +494,10 @@ func connectToNode(addr string) {
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
 				nodesMu.Lock()
-				delete(nodes, addr)
+				// 別の接続が同じアドレスで登録されていれば削除しない
+				if cur, ok := nodes[addr]; ok && cur == node {
+					delete(nodes, addr)
+				}
 				nodesMu.Unlock()
 				log.Printf("node disconnected: %s", addr)
 				return
@@ -412,14 +538,13 @@ func handleGetPubkey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	number := strings.TrimPrefix(r.URL.Path, "/pubkey/")
-	email, pubkey, err := getUserByNumber(number)
+	_, pubkey, err := getUserByNumber(number)
 	if err != nil {
 		http.Error(w, "user not found", http.StatusNotFound)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"email":      email,
 		"public_key": pubkey,
 	})
 }
@@ -466,7 +591,12 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, _ := generateToken()
+	token, err := generateToken()
+	if err != nil {
+		log.Printf("failed to generate token: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	tokensMu.Lock()
 	putToken(emailVerifyTokens, token, email)
 	tokensMu.Unlock()
@@ -530,10 +660,7 @@ func handleNew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tokensMu.RLock()
-	email, ok := getTokenEmail(emailVerifyTokens, token)
-	tokensMu.RUnlock()
-
+	email, ok := atomicConsumeToken(emailVerifyTokens, token)
 	if !ok {
 		http.Error(w, "invalid token", http.StatusUnauthorized)
 		return
@@ -545,10 +672,6 @@ func handleNew(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "creation failed", http.StatusInternalServerError)
 		return
 	}
-
-	tokensMu.Lock()
-	delete(emailVerifyTokens, token)
-	tokensMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"number": number})
@@ -582,7 +705,12 @@ func handleResetRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, _ := generateToken()
+	token, err := generateToken()
+	if err != nil {
+		log.Printf("failed to generate reset token: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	tokensMu.Lock()
 	putToken(resetTokens, token, email)
 	tokensMu.Unlock()
@@ -615,10 +743,7 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tokensMu.RLock()
-	email, ok := getTokenEmail(resetTokens, token)
-	tokensMu.RUnlock()
-
+	email, ok := atomicConsumeToken(resetTokens, token)
 	if !ok {
 		http.Error(w, "invalid token", http.StatusUnauthorized)
 		return
@@ -631,10 +756,6 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tokensMu.Lock()
-	delete(resetTokens, token)
-	tokensMu.Unlock()
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"number": number, "status": "ok"})
 }
@@ -645,48 +766,38 @@ func handleSMSSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	var msg Message
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-
-	// メッセージワード構築
-	message := map[string]interface{}{
-		"timestamp": body["timestamp"],
-		"message":   body["message"],
-		"to":        body["to"],
-		"from":      body["from"],
-		"sig":       body["sig"],
+	if msg.Timestamp == 0 {
+		msg.Timestamp = time.Now().UTC().Unix()
 	}
 
-	// ノード選択（最初のノードを使用）
-	nodesMu.RLock()
-	var nodeAddr string
-	for addr := range nodes {
-		nodeAddr = addr
-		break
-	}
-	nodesMu.RUnlock()
-
-	if nodeAddr == "" {
-		http.Error(w, "no nodes available", http.StatusServiceUnavailable)
+	// 署名検証（送信者が正規ユーザーであることを確認）
+	if err := verifyMessageSignature(&msg); err != nil {
+		log.Printf("sms signature verification failed from=%s: %v", msg.From, err)
+		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
 
-	// ノードに HTTP POST でメッセージ保存指示
-	msgJSON, _ := json.Marshal(message)
-	resp, err := http.Post(
-		"http://"+nodeAddr+"/store-message",
-		"application/json",
-		strings.NewReader(string(msgJSON)),
-	)
-	if err != nil {
-		log.Printf("failed to send message to node: %v", err)
+	// DBに直接保存（ノード経由ではなく window が直接保存することでHTTP/TLSの
+	// 不整合および ephemeral port 問題を回避する）
+	var storeOut map[string]string
+	if err := dbWSCall("messages.store", msg, &storeOut); err != nil {
+		log.Printf("sms store failed to=%s: %v", msg.To, err)
 		http.Error(w, "failed to store message", http.StatusInternalServerError)
 		return
 	}
-	defer resp.Body.Close()
+
+	// ライブ配信のためにメッシュ経由でブロードキャスト（ベストエフォート）
+	// ノード側はDB保存をせず、オンラインなら即配信するだけにする
+	broadcastMsg, _ := json.Marshal(map[string]any{
+		"type": "sms",
+		"data": msg,
+	})
+	broadcast(broadcastMsg)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -794,7 +905,10 @@ func handleICESignal(w http.ResponseWriter, r *http.Request, signalType string) 
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	if strings.TrimSpace(fmt.Sprintf("%v", body["from"])) == "" || strings.TrimSpace(fmt.Sprintf("%v", body["to"])) == "" {
+	// 型アサーションで文字列を取得する。null や非文字列型は空文字として扱われる。
+	from, _ := body["from"].(string)
+	to, _ := body["to"].(string)
+	if strings.TrimSpace(from) == "" || strings.TrimSpace(to) == "" {
 		http.Error(w, "missing from or to", http.StatusBadRequest)
 		return
 	}
@@ -894,10 +1008,10 @@ func main() {
 	certFile := os.Getenv("CERT_FILE")
 	keyFile := os.Getenv("KEY_FILE")
 	seedDomain = fixedSeedDomain
-	number := os.Getenv("NUMBER") // 例: 02
+	routeNumber = os.Getenv("NUMBER") // 例: 02
 
-	if seedDomain != "" && number != "" {
-		startSeedWatcher(seedDomain, number)
+	if seedDomain != "" && routeNumber != "" {
+		startSeedWatcher(seedDomain, routeNumber)
 	} else {
 		log.Println("fixed seed domain or NUMBER not set, skipping DNS seed")
 	}
@@ -928,12 +1042,12 @@ func main() {
 
 	if certFile != "" && keyFile != "" {
 		log.Println("window listening on :" + port + " (TLS)")
-		if err := http.ListenAndServeTLS(":"+port, certFile, keyFile, mux); err != nil {
+		if err := http.ListenAndServeTLS(":"+port, certFile, keyFile, corsMiddleware(mux)); err != nil {
 			log.Fatal(err)
 		}
 	} else {
 		log.Println("window listening on :" + port)
-		if err := http.ListenAndServe(":"+port, mux); err != nil {
+		if err := http.ListenAndServe(":"+port, corsMiddleware(mux)); err != nil {
 			log.Fatal(err)
 		}
 	}

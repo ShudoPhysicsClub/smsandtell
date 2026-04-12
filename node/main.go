@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -42,6 +43,15 @@ var (
 	clients   = make(map[string]*ClientConn)
 	clientsMu sync.RWMutex
 )
+
+// sendJSON は client.mu を保持した状態で WebSocket に JSON を書き込む。
+// handleClientWS 内の直接 conn.WriteJSON 呼び出しと deliverOrStore / mesh relay の
+// 並行書き込みを防ぐため、すべての送信はこのメソッドを経由する。
+func (c *ClientConn) sendJSON(v any) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.WriteJSON(v)
+}
 
 type Message struct {
 	Timestamp int64           `json:"timestamp"`
@@ -152,8 +162,8 @@ func dbWSCall(action string, payload any, out any) error {
 }
 
 func getPublicKeyByNumber(number string) (string, error) {
-	url := strings.TrimRight(windowAPIBase, "/") + "/pubkey/" + number
-	resp, err := http.Get(url)
+	reqURL := strings.TrimRight(windowAPIBase, "/") + "/pubkey/" + url.PathEscape(number)
+	resp, err := http.Get(reqURL)
 	if err != nil {
 		return "", err
 	}
@@ -319,6 +329,31 @@ var (
 	challengesMu sync.RWMutex
 )
 
+// startChallengeSweeper は期限切れチャレンジを定期的にメモリから削除する。
+// 認証を完了しないままの接続が残した場合でもメモリリークしないようにする。
+func startChallengeSweeper() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			challengesMu.Lock()
+			for userID, items := range challenges {
+				for ch, exp := range items {
+					t, err := time.Parse(time.RFC3339, exp)
+					if err != nil || now.After(t) {
+						delete(items, ch)
+					}
+				}
+				if len(items) == 0 {
+					delete(challenges, userID)
+				}
+			}
+			challengesMu.Unlock()
+		}
+	}()
+}
+
 func generateChallenge(userID string) (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -351,6 +386,11 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userIDStr := strings.TrimSpace(string(userIDBytes))
+	if userIDStr == "" || len(userIDStr) > 128 {
+		// 空文字または過剰長の userID は拒否して接続を閉じる
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"invalid user id"}`))
+		return
+	}
 	client := &ClientConn{conn: conn, userID: userIDStr}
 
 	clientsMu.Lock()
@@ -361,7 +401,11 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 
 	defer func() {
 		clientsMu.Lock()
-		delete(clients, userIDStr)
+		// 再接続で同じ userID の新しい ClientConn がすでに登録されている場合は
+		// 古い goroutine の defer が新しい接続を誤って削除しないようにする。
+		if clients[userIDStr] == client {
+			delete(clients, userIDStr)
+		}
 		clientsMu.Unlock()
 		log.Printf("client disconnected: %s", userIDStr)
 	}()
@@ -374,63 +418,68 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 
 		action, ok := req["action"].(string)
 		if !ok {
-			conn.WriteJSON(map[string]string{"error": "missing action"})
+			client.sendJSON(map[string]string{"error": "missing action"})
 			continue
 		}
 
 		switch action {
 		case "challenge":
-			challenge, _ := generateChallenge(userIDStr)
-			conn.WriteJSON(map[string]string{"challenge": challenge})
+			challenge, err := generateChallenge(userIDStr)
+			if err != nil {
+				log.Printf("failed to generate challenge for %s: %v", userIDStr, err)
+				client.sendJSON(map[string]string{"error": "internal error"})
+				continue
+			}
+			client.sendJSON(map[string]string{"challenge": challenge})
 
 		case "auth_verify":
 			challenge, _ := req["challenge"].(string)
 			sig, _ := req["sig"].(string)
 			if challenge == "" || sig == "" {
-				conn.WriteJSON(map[string]string{"error": "missing challenge or sig"})
+				client.sendJSON(map[string]string{"error": "missing challenge or sig"})
 				continue
 			}
 			if err := verifyAuthSignature(userIDStr, challenge, sig); err != nil {
-				conn.WriteJSON(map[string]string{"error": "auth failed"})
+				client.sendJSON(map[string]string{"error": "auth failed"})
 				continue
 			}
 			authenticated = true
 			client.mu.Lock()
 			client.authed = true
 			client.mu.Unlock()
-			conn.WriteJSON(map[string]string{"status": "authenticated"})
+			client.sendJSON(map[string]string{"status": "authenticated"})
 
 			messages, err := popMessages(userIDStr)
 			if err == nil && len(messages) > 0 {
-				if err := conn.WriteJSON(map[string]interface{}{"action": "messages", "messages": messages}); err != nil {
+				if err := client.sendJSON(map[string]interface{}{"action": "messages", "messages": messages}); err != nil {
 					log.Printf("failed to send cached messages: %v", err)
 				}
 			}
 
 		case "send_message":
 			if !authenticated {
-				conn.WriteJSON(map[string]string{"error": "not authenticated"})
+				client.sendJSON(map[string]string{"error": "not authenticated"})
 				continue
 			}
 			msgData, _ := json.Marshal(req["data"])
 			var msg Message
 			if err := json.Unmarshal(msgData, &msg); err != nil {
-				conn.WriteJSON(map[string]string{"error": "invalid message"})
+				client.sendJSON(map[string]string{"error": "invalid message"})
 				continue
 			}
 			msg.From = userIDStr
 			if err := verifyMessageSignature(&msg); err != nil {
-				conn.WriteJSON(map[string]string{"error": "invalid signature"})
+				client.sendJSON(map[string]string{"error": "invalid signature"})
 				continue
 			}
 			if err := deliverOrStore(&msg); err != nil {
-				conn.WriteJSON(map[string]string{"error": "failed to save message"})
+				client.sendJSON(map[string]string{"error": "failed to save message"})
 				continue
 			}
-			conn.WriteJSON(map[string]string{"status": "ok"})
+			client.sendJSON(map[string]string{"status": "ok"})
 
 		default:
-			conn.WriteJSON(map[string]string{"error": "unknown action"})
+			client.sendJSON(map[string]string{"error": "unknown action"})
 		}
 	}
 }
@@ -465,27 +514,15 @@ func handleMeshWS(w http.ResponseWriter, r *http.Request) {
 		clientsMu.RUnlock()
 
 		if msg.Type == "sms" {
-			// SMS: オンラインなら即配信、いなければDB保存
+			// SMS: windowがすでにDBに保存済みのため、ここではライブ配信のみ行う。
+			// DB保存は window/handleSMSSend が責任を持つ。
 			if ok {
 				target.mu.Lock()
 				authed := target.authed
-				var deliverErr error
 				if authed {
-					deliverErr = target.conn.WriteJSON(map[string]any{"action": "messages", "messages": []map[string]any{msg.Data}})
+					_ = target.conn.WriteJSON(map[string]any{"action": "messages", "messages": []map[string]any{msg.Data}})
 				}
 				target.mu.Unlock()
-				if authed && deliverErr == nil {
-					continue // 配信成功 → DB保存不要
-				}
-				log.Printf("sms deliver failed to %s, saving to db", to)
-			}
-			// オフライン or 配信失敗 → DB保存
-			raw, _ := json.Marshal(msg.Data)
-			var m Message
-			if err := json.Unmarshal(raw, &m); err == nil {
-				if err := saveMessage(&m); err != nil {
-					log.Printf("sms save failed for %s: %v", to, err)
-				}
 			}
 			continue
 		}
@@ -494,14 +531,15 @@ func handleMeshWS(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			continue
 		}
+		var relayErr error
 		target.mu.Lock()
 		authed := target.authed
 		if authed {
-			err = target.conn.WriteJSON(map[string]any{"action": msg.Type, "data": msg.Data})
+			relayErr = target.conn.WriteJSON(map[string]any{"action": msg.Type, "data": msg.Data})
 		}
 		target.mu.Unlock()
-		if err != nil {
-			log.Printf("mesh relay failed to %s: %v", to, err)
+		if relayErr != nil {
+			log.Printf("mesh relay failed to %s: %v", to, relayErr)
 		}
 	}
 }
@@ -538,6 +576,8 @@ func main() {
 	if err := initDBService(); err != nil {
 		log.Fatal(err)
 	}
+
+	startChallengeSweeper()
 
 	port := os.Getenv("PORT")
 	if port == "" {
