@@ -539,17 +539,15 @@ async function encryptPrivateKey(privateKeyHex: string, password: string): Promi
   crypto.getRandomValues(saltArr);
   const ivArr = new Uint8Array(12);
   crypto.getRandomValues(ivArr);
-  const salt = saltArr as unknown as Uint8Array<ArrayBuffer>;
-  const iv = ivArr as unknown as Uint8Array<ArrayBuffer>;
   const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']);
   const aesKey = await crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt: saltArr.buffer, iterations: 100000, hash: 'SHA-256' },
     keyMaterial,
     { name: 'AES-GCM', length: 256 },
     false,
     ['encrypt'],
   );
-  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, enc.encode(privateKeyHex));
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: ivArr.buffer }, aesKey, enc.encode(privateKeyHex));
   return `v1:${_bytesToHexLocal(saltArr)}:${_bytesToHexLocal(ivArr)}:${_bytesToHexLocal(new Uint8Array(ciphertext))}`;
 }
 
@@ -557,13 +555,13 @@ async function decryptPrivateKey(encrypted: string, password: string): Promise<s
   const parts = encrypted.split(':');
   if (parts.length !== 4 || parts[0] !== 'v1') throw new Error('保存済みの鍵の形式が不正です');
   const [, saltHex, ivHex, cipherHex] = parts as [string, string, string, string];
-  const salt = _hexToBytesLocal(saltHex) as unknown as Uint8Array<ArrayBuffer>;
-  const iv = _hexToBytesLocal(ivHex) as unknown as Uint8Array<ArrayBuffer>;
-  const ciphertext = _hexToBytesLocal(cipherHex) as unknown as Uint8Array<ArrayBuffer>;
+  const saltArr = _hexToBytesLocal(saltHex);
+  const ivArr = _hexToBytesLocal(ivHex);
+  const ciphertextArr = _hexToBytesLocal(cipherHex);
   const enc = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']);
   const aesKey = await crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt: saltArr.buffer, iterations: 100000, hash: 'SHA-256' },
     keyMaterial,
     { name: 'AES-GCM', length: 256 },
     false,
@@ -571,7 +569,7 @@ async function decryptPrivateKey(encrypted: string, password: string): Promise<s
   );
   let plaintext: ArrayBuffer;
   try {
-    plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, aesKey, ciphertext);
+    plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivArr.buffer }, aesKey, ciphertextArr.buffer);
   } catch {
     throw new Error('パスワードが違います');
   }
