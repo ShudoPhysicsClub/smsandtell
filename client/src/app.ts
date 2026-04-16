@@ -83,7 +83,8 @@ let lastToastCount = 0;
 const LS_WINDOW_BASE = 'smsandtell.windowBase';
 const LS_NUMBER = 'smsandtell.number';
 const LS_PHONE_NUMBER = 'smsandtell.phoneNumber';
-const LS_PRIVATE_KEY = 'smsandtell.privateKey';
+const LS_PRIVATE_KEY = 'smsandtell.privateKey'; // legacy: plain-text key (migration only)
+const LS_ENCRYPTED_KEY = 'smsandtell.encryptedKey'; // v1:<saltHex>:<ivHex>:<ciphertextHex>
 const LS_PUBLIC_KEY = 'smsandtell.publicKey';
 const LS_PERSIST_SENSITIVE = 'smsandtell.persistSensitive';
 const CHAT_DB_NAME = 'smsandtell-chat';
@@ -523,6 +524,60 @@ function normalizePrivateKeyHex(privateKeyHex: string): string {
   return hex;
 }
 
+function _bytesToHexLocal(bytes: Uint8Array): string {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function _hexToBytesLocal(hex: string): Uint8Array {
+  const pairs = hex.match(/.{2}/g) ?? [];
+  return new Uint8Array(pairs.map(b => parseInt(b, 16)));
+}
+
+async function encryptPrivateKey(privateKeyHex: string, password: string): Promise<string> {
+  const enc = new TextEncoder();
+  const saltArr = new Uint8Array(16);
+  crypto.getRandomValues(saltArr);
+  const ivArr = new Uint8Array(12);
+  crypto.getRandomValues(ivArr);
+  const salt = saltArr as unknown as Uint8Array<ArrayBuffer>;
+  const iv = ivArr as unknown as Uint8Array<ArrayBuffer>;
+  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']);
+  const aesKey = await crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt'],
+  );
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, enc.encode(privateKeyHex));
+  return `v1:${_bytesToHexLocal(saltArr)}:${_bytesToHexLocal(ivArr)}:${_bytesToHexLocal(new Uint8Array(ciphertext))}`;
+}
+
+async function decryptPrivateKey(encrypted: string, password: string): Promise<string> {
+  const parts = encrypted.split(':');
+  if (parts.length !== 4 || parts[0] !== 'v1') throw new Error('保存済みの鍵の形式が不正です');
+  const [, saltHex, ivHex, cipherHex] = parts as [string, string, string, string];
+  const salt = _hexToBytesLocal(saltHex) as unknown as Uint8Array<ArrayBuffer>;
+  const iv = _hexToBytesLocal(ivHex) as unknown as Uint8Array<ArrayBuffer>;
+  const ciphertext = _hexToBytesLocal(cipherHex) as unknown as Uint8Array<ArrayBuffer>;
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']);
+  const aesKey = await crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['decrypt'],
+  );
+  let plaintext: ArrayBuffer;
+  try {
+    plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, aesKey, ciphertext);
+  } catch {
+    throw new Error('パスワードが違います');
+  }
+  return new TextDecoder().decode(plaintext);
+}
+
 function createChallengeHex(): string {
   const b = new Uint8Array(32);
   crypto.getRandomValues(b);
@@ -730,10 +785,9 @@ async function handleSignalAction(action: string, payload: unknown): Promise<voi
   if (action === 'call_auth_challenge') {
     const challenge = String(body.challenge ?? '').trim();
     if (!from || !challenge) return;
-    // セッション中の秘密鍵を優先。persist=offでlocalStorageにない場合でも動作する
-    const privateKeyHex =
-      currentPrivateKeyHex ||
-      normalizePrivateKeyHex(localStorage.getItem(LS_PRIVATE_KEY) ?? '');
+    // セッション中の秘密鍵を使用する
+    const privateKeyHex = currentPrivateKeyHex;
+    if (!privateKeyHex) return;
     const sig = makeAuthSignatureHex(currentNumber, challenge, privateKeyHex);
     setCallPhase('verifying', `${from} に認証応答を送信`);
     await sendCallAuthResponse(windowBase, { from: currentNumber, to: from, challenge, sig });
@@ -1067,7 +1121,6 @@ export function buildUI(): void {
   const privateKeyInput = createInput('privateKey', '秘密鍵 (hex)');
   privateKeyInput.type = 'password';
   privateKeyInput.autocomplete = 'off';
-  privateKeyInput.value = localStorage.getItem(LS_PRIVATE_KEY) ?? '';
   let privateKeyMaskTimer: number | null = null;
 
   // --- メインセクション: 番号 + ニーモニック ---
@@ -1097,7 +1150,7 @@ export function buildUI(): void {
   persistSensitiveLabel.style.gap = '6px';
   persistSensitiveLabel.style.fontSize = '12px';
   persistSensitiveLabel.style.color = 'rgba(255,255,255,.7)';
-  persistSensitiveLabel.style.marginBottom = '1.2rem';
+  persistSensitiveLabel.style.marginBottom = '0.6rem';
   const persistSensitiveCheck = document.createElement('input');
   persistSensitiveCheck.type = 'checkbox';
   persistSensitiveCheck.checked = (localStorage.getItem(LS_PERSIST_SENSITIVE) ?? '1') !== '0';
@@ -1106,6 +1159,19 @@ export function buildUI(): void {
   persistSensitiveLabel.appendChild(persistSensitiveCheck);
   persistSensitiveLabel.appendChild(persistSensitiveText);
   loginCard.appendChild(persistSensitiveLabel);
+
+  // 保存用パスワード（端末に保存チェック時のみ表示）
+  const savePasswordInput = createInput('savePassword', 'パスワード（保存・復元に使用）');
+  savePasswordInput.type = 'password';
+  savePasswordInput.autocomplete = 'new-password';
+  const savePasswordGroup = makeFormGroup('保存パスワード', savePasswordInput);
+  savePasswordGroup.style.marginBottom = '1.2rem';
+  const hasSavedEncryptedKey = !!localStorage.getItem(LS_ENCRYPTED_KEY);
+  savePasswordGroup.style.display = (persistSensitiveCheck.checked || hasSavedEncryptedKey) ? 'block' : 'none';
+  loginCard.appendChild(savePasswordGroup);
+  persistSensitiveCheck.addEventListener('change', () => {
+    savePasswordGroup.style.display = persistSensitiveCheck.checked ? 'block' : 'none';
+  });
 
   const btnLookupConnect = makePrimaryBtn('btnLookupConnect', 'ログイン');
   loginCard.appendChild(btnLookupConnect);
@@ -2144,9 +2210,19 @@ export function buildUI(): void {
     try {
     currentNumber = numberInput.value.trim();
     const mnemonicValue = mnemonicLoginTextarea.value.trim();
-    const privateKeyHex = mnemonicValue
-      ? await mnemonicToPrivateKeyHex(mnemonicValue)
-      : normalizePrivateKeyHex(privateKeyInput.value);
+    let privateKeyHex: string;
+    if (mnemonicValue) {
+      privateKeyHex = await mnemonicToPrivateKeyHex(mnemonicValue);
+    } else if (privateKeyInput.value.trim()) {
+      privateKeyHex = normalizePrivateKeyHex(privateKeyInput.value);
+    } else {
+      // 保存済みの暗号化鍵を復元する
+      const savedEncrypted = localStorage.getItem(LS_ENCRYPTED_KEY) ?? '';
+      if (!savedEncrypted) throw new Error('秘密鍵またはニーモニックを入力してください');
+      const password = savePasswordInput.value;
+      if (!password) throw new Error('保存済みの鍵を使うにはパスワードを入力してください');
+      privateKeyHex = normalizePrivateKeyHex(await decryptPrivateKey(savedEncrypted, password));
+    }
 
     if (!currentNumber) {
       throw new Error('number は必須');
@@ -2157,9 +2233,12 @@ export function buildUI(): void {
 
     localStorage.setItem(LS_PERSIST_SENSITIVE, persistSensitiveCheck.checked ? '1' : '0');
     if (persistSensitiveCheck.checked) {
-      localStorage.setItem(LS_PRIVATE_KEY, privateKeyHex);
+      const password = savePasswordInput.value;
+      if (!password) throw new Error('端末保存にはパスワードを入力してください');
+      const encrypted = await encryptPrivateKey(privateKeyHex, password);
+      localStorage.setItem(LS_ENCRYPTED_KEY, encrypted);
     } else {
-      localStorage.removeItem(LS_PRIVATE_KEY);
+      localStorage.removeItem(LS_ENCRYPTED_KEY);
       localStorage.removeItem(LS_PUBLIC_KEY);
     }
     const derivedPubHex = derivePublicKeyHex(privateKeyHex);
@@ -2257,10 +2336,13 @@ export function buildUI(): void {
       const privateKeyHex = signupGeneratedKeyHex;
       const pubHex = derivePublicKeyHex(privateKeyHex);
       if (persistSensitiveCheck.checked) {
-        localStorage.setItem(LS_PRIVATE_KEY, privateKeyHex);
+        const password = savePasswordInput.value;
+        if (!password) throw new Error('端末保存にはパスワードを入力してください');
+        const encrypted = await encryptPrivateKey(privateKeyHex, password);
+        localStorage.setItem(LS_ENCRYPTED_KEY, encrypted);
         localStorage.setItem(LS_PUBLIC_KEY, pubHex);
       } else {
-        localStorage.removeItem(LS_PRIVATE_KEY);
+        localStorage.removeItem(LS_ENCRYPTED_KEY);
         localStorage.removeItem(LS_PUBLIC_KEY);
       }
       const number = await createAccount(windowBase, signupTokenInput.value.trim(), pubHex);
@@ -2312,10 +2394,13 @@ export function buildUI(): void {
       const privateKeyHex = resetGeneratedKeyHex;
       const pubHex = derivePublicKeyHex(privateKeyHex);
       if (persistSensitiveCheck.checked) {
-        localStorage.setItem(LS_PRIVATE_KEY, privateKeyHex);
+        const password = savePasswordInput.value;
+        if (!password) throw new Error('端末保存にはパスワードを入力してください');
+        const encrypted = await encryptPrivateKey(privateKeyHex, password);
+        localStorage.setItem(LS_ENCRYPTED_KEY, encrypted);
         localStorage.setItem(LS_PUBLIC_KEY, pubHex);
       } else {
-        localStorage.removeItem(LS_PRIVATE_KEY);
+        localStorage.removeItem(LS_ENCRYPTED_KEY);
         localStorage.removeItem(LS_PUBLIC_KEY);
       }
       const number = await resetDo(windowBase, resetTokenInput.value.trim(), pubHex);
@@ -2348,10 +2433,10 @@ export function buildUI(): void {
       if (!to) throw new Error('to is required');
       if (!from) throw new Error('from is required');
       if (!body) throw new Error('message is required');
-      // セッション変数を優先。persist=offや入力欄クリア後でも署名できる
+      // セッション変数を使用する
       const privateKeyHex =
         currentPrivateKeyHex ||
-        normalizePrivateKeyHex((privateKeyInput.value || localStorage.getItem(LS_PRIVATE_KEY)) ?? '');
+        normalizePrivateKeyHex(privateKeyInput.value || '');
       const sig = makeMessageSignatureHex(from, to, { body }, timestamp, privateKeyHex);
 
       pendingId = crypto.randomUUID();
@@ -2455,15 +2540,19 @@ export function buildUI(): void {
     }
   };
 
+  // 起動時: 旧形式（プレーンテキスト）の秘密鍵が残っていれば削除して移行する
+  if (localStorage.getItem(LS_PRIVATE_KEY)) {
+    localStorage.removeItem(LS_PRIVATE_KEY);
+  }
+
   const savedNumber = (localStorage.getItem(LS_PHONE_NUMBER) ?? localStorage.getItem(LS_NUMBER) ?? '').trim();
-  const savedPrivateKey = (localStorage.getItem(LS_PRIVATE_KEY) ?? '').trim();
+  const savedEncryptedKey = (localStorage.getItem(LS_ENCRYPTED_KEY) ?? '').trim();
   const persistSensitiveEnabled = (localStorage.getItem(LS_PERSIST_SENSITIVE) ?? '1') !== '0';
   persistSensitiveCheck.checked = persistSensitiveEnabled;
-  if (persistSensitiveEnabled && savedNumber && savedPrivateKey) {
+  if (persistSensitiveEnabled && savedNumber && savedEncryptedKey) {
     numberInput.value = savedNumber;
-    privateKeyInput.value = savedPrivateKey;
-    void doLogin({ silent: true }).catch(() => {
-      closeNodeWS();
-    });
+    // パスワード入力欄を表示してログインを促す（自動ログインは行わない）
+    savePasswordGroup.style.display = 'block';
+    setStatus('保存済みのデータがあります。パスワードを入力してログインしてください。');
   }
 }
