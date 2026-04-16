@@ -82,7 +82,6 @@ let lastToastCount = 0;
 
 const LS_WINDOW_BASE = 'smsandtell.windowBase';
 const LS_NUMBER = 'smsandtell.number';
-const LS_PHONE_NUMBER = 'smsandtell.phoneNumber';
 const LS_EMAIL = 'smsandtell.email';
 const LS_PRIVATE_KEY = 'smsandtell.privateKey'; // legacy: plain-text key (migration only)
 const CHAT_DB_NAME = 'smsandtell-chat';
@@ -1066,12 +1065,6 @@ export function buildUI(): void {
   signupStep2.appendChild(makeFormGroup('パスワード', signupPasswordInput));
   signupStep2.appendChild(makeFormGroup('パスワード（確認）', signupPasswordConfirmInput));
 
-  const signupConfirmCheck = document.createElement('input');
-  signupConfirmCheck.type = 'checkbox';
-  signupConfirmCheck.style.display = 'none';
-  signupConfirmCheck.checked = true; // パスワード登録では確認不要
-
-
   signupCard.appendChild(signupStep1);
   signupCard.appendChild(signupStep2);
 
@@ -1116,11 +1109,6 @@ export function buildUI(): void {
   resetStep2.appendChild(makeFormGroup('トークン', resetTokenInput));
   resetStep2.appendChild(makeFormGroup('新しいパスワード', resetPasswordInput));
   resetStep2.appendChild(makeFormGroup('新しいパスワード（確認）', resetPasswordConfirmInput));
-
-  const resetConfirmCheck = document.createElement('input');
-  resetConfirmCheck.type = 'checkbox';
-  resetConfirmCheck.style.display = 'none';
-  resetConfirmCheck.checked = true; // パスワード変更では確認不要
 
   const syncResponsiveUI = (): void => {
     const isNarrow = window.innerWidth < 640;
@@ -1171,8 +1159,6 @@ export function buildUI(): void {
     chatScreenTitle.style.display = 'none';
   }
   const smsToInput = createInput('smsTo', 'to number');
-  const smsFromInput = createInput('smsFrom', 'from number');
-  const smsSigInput = createInput('smsSig', 'signature hex');
   const smsBody = document.createElement('textarea');
   smsBody.id = 'smsBody';
   smsBody.placeholder = 'メッセージ';
@@ -1923,13 +1909,11 @@ export function buildUI(): void {
 
       localStorage.setItem(LS_EMAIL, email);
       localStorage.setItem(LS_NUMBER, currentNumber);
-      localStorage.setItem(LS_PHONE_NUMBER, currentNumber);
 
       const seed = await resolveSeed(currentNumber);
       windowBase = seed.windowBase;
       localStorage.setItem(LS_WINDOW_BASE, windowBase);
 
-      smsFromInput.value = currentNumber;
       nodeWsUrl = seed.nodeWs;
       if (!nodeWsUrl) throw new Error('node ws resolve failed');
 
@@ -2009,7 +1993,6 @@ export function buildUI(): void {
       currentNumber = number;
       localStorage.setItem(LS_EMAIL, signupEmailInput.value.trim());
       localStorage.setItem(LS_NUMBER, number);
-      localStorage.setItem(LS_PHONE_NUMBER, number);
       loginEmailInput.value = signupEmailInput.value.trim();
       setActiveScreen('login');
     } catch (err) {
@@ -2054,7 +2037,6 @@ export function buildUI(): void {
       currentNumber = number;
       localStorage.setItem(LS_EMAIL, resetEmailInput.value.trim());
       localStorage.setItem(LS_NUMBER, number);
-      localStorage.setItem(LS_PHONE_NUMBER, number);
       loginEmailInput.value = resetEmailInput.value.trim();
       setActiveScreen('login');
     } catch (err) {
