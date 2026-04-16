@@ -2441,10 +2441,10 @@ export function buildUI(): void {
       if (!to) throw new Error('to is required');
       if (!from) throw new Error('from is required');
       if (!body) throw new Error('message is required');
-      // セッション変数を使用する
-      const privateKeyHex =
-        currentPrivateKeyHex ||
-        normalizePrivateKeyHex(privateKeyInput.value || '');
+      // セッション変数を使用する（未ログイン状態ではここに到達しないが念のためチェック）
+      const rawPrivKey = currentPrivateKeyHex || privateKeyInput.value.trim();
+      if (!rawPrivKey) throw new Error('セッションが切れました。再ログインしてください。');
+      const privateKeyHex = normalizePrivateKeyHex(rawPrivKey);
       const sig = makeMessageSignatureHex(from, to, { body }, timestamp, privateKeyHex);
 
       pendingId = crypto.randomUUID();
@@ -2557,7 +2557,7 @@ export function buildUI(): void {
     localStorage.removeItem(LS_PRIVATE_KEY);
     privateKeySection.style.display = 'block';
     privateKeyToggle.textContent = '▼ 秘密鍵で直接ログインする';
-    setStatus('セキュリティのため、端末保存の形式が変更されました。パスワードを設定して再度ログインしてください。');
+    setStatus('セキュリティのため保存形式が変更されました。「端末に保存」にチェックを入れてパスワードを設定し、再度ログインしてください（チェックなしでもログインできます）。');
   } else if (localStorage.getItem(LS_PRIVATE_KEY)) {
     localStorage.removeItem(LS_PRIVATE_KEY);
   }
