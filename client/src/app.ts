@@ -856,7 +856,8 @@ export function buildUI(): void {
   document.body.style.height = '100%';
   document.body.style.margin = '0';
   document.body.style.background = '#13111c';
-  document.body.style.overflow = 'hidden';
+  document.body.style.overflowX = 'hidden';
+  document.body.style.overflowY = 'auto';
 
   const container = document.createElement('div');
   container.style.width = '100%';
@@ -971,6 +972,7 @@ export function buildUI(): void {
     const outerWrap = document.createElement('div');
     outerWrap.style.cssText =
       'width:100%;max-width:460px;position:relative;';
+    outerWrap.dataset['role'] = 'auth-card-wrap';
     const card = document.createElement('div');
     card.style.cssText =
       'width:100%;padding:52px 48px 44px 48px;box-sizing:border-box;' +
@@ -979,6 +981,7 @@ export function buildUI(): void {
       'border:1px solid rgba(255,255,255,0.1);' +
       'border-radius:24px;' +
       'box-shadow:0 24px 64px rgba(0,0,0,0.5)';
+    card.dataset['role'] = 'auth-card';
     const h2 = document.createElement('h2');
     h2.textContent = title;
     h2.style.textAlign = 'center';
@@ -989,7 +992,7 @@ export function buildUI(): void {
     h2.style.letterSpacing = '-0.3px';
     card.appendChild(h2);
     outerWrap.appendChild(card);
-    (card as Record<string, unknown>)['__outerWrap'] = outerWrap;
+    (card as unknown as { __outerWrap?: HTMLElement }).__outerWrap = outerWrap;
     return card;
   };
 
@@ -1168,7 +1171,7 @@ export function buildUI(): void {
 
   loginCard.appendChild(makeLinkBtn('新規登録はこちら', () => setActiveScreen('signup')));
   loginCard.appendChild(makeLinkBtn('パスワードを忘れた方', () => setActiveScreen('reset')));
-  loginScreen.appendChild((loginCard as Record<string, unknown>)['__outerWrap'] as HTMLElement ?? loginCard);
+  loginScreen.appendChild((loginCard as unknown as { __outerWrap?: HTMLElement }).__outerWrap ?? loginCard);
 
   // --- 新規登録画面 ---
   const signupScreen = document.createElement('div');
@@ -1268,7 +1271,7 @@ export function buildUI(): void {
   signupButtonWrap.appendChild(btnCreate);
   signupCard.appendChild(signupButtonWrap);
   signupCard.appendChild(makeLinkBtn('すでにアカウントをお持ちの方', () => setActiveScreen('login')));
-  signupScreen.appendChild((signupCard as Record<string, unknown>)['__outerWrap'] as HTMLElement ?? signupCard);
+  signupScreen.appendChild((signupCard as unknown as { __outerWrap?: HTMLElement }).__outerWrap ?? signupCard);
 
   // --- 再設定画面 ---
   const resetScreen = document.createElement('div');
@@ -1339,6 +1342,40 @@ export function buildUI(): void {
   resetBtnRow.appendChild(btnResetRegen);
   resetStep2.appendChild(resetBtnRow);
 
+  const syncResponsiveUI = (): void => {
+    const isNarrow = window.innerWidth < 640;
+
+    for (const screen of [loginScreen, signupScreen, resetScreen]) {
+      screen.style.alignItems = isNarrow ? 'flex-start' : 'center';
+      screen.style.padding = isNarrow ? '20px 12px 24px 12px' : '40px 16px';
+    }
+
+    for (const card of [loginCard, signupCard, resetCard]) {
+      card.style.padding = isNarrow ? '28px 20px 24px 20px' : '52px 48px 44px 48px';
+      card.style.borderRadius = isNarrow ? '18px' : '24px';
+    }
+
+    signupMnemonicGrid.style.gridTemplateColumns = isNarrow ? 'repeat(2,minmax(0,1fr))' : 'repeat(3,minmax(0,1fr))';
+    resetMnemonicGrid.style.gridTemplateColumns = isNarrow ? 'repeat(2,minmax(0,1fr))' : 'repeat(3,minmax(0,1fr))';
+
+    for (const row of [signupBtnRow, resetBtnRow]) {
+      row.style.flexWrap = isNarrow ? 'wrap' : 'nowrap';
+    }
+    for (const btn of [btnSignupCopyMnemonic, btnSignupRegen, btnResetCopyMnemonic, btnResetRegen]) {
+      btn.style.flex = isNarrow ? '1 1 calc(50% - 4px)' : '0 0 auto';
+    }
+
+    privateKeyControl.style.flexWrap = isNarrow ? 'wrap' : 'nowrap';
+    if (toastHostNode) {
+      toastHostNode.style.left = isNarrow ? '12px' : '';
+      toastHostNode.style.right = isNarrow ? '12px' : '14px';
+      toastHostNode.style.maxWidth = isNarrow ? 'none' : '340px';
+    }
+  };
+
+  syncResponsiveUI();
+  window.addEventListener('resize', syncResponsiveUI);
+
   const resetConfirmLabel = document.createElement('label');
   resetConfirmLabel.style.cssText = 'display:flex;align-items:flex-start;gap:6px;font-size:13px;color:#ddd;margin-bottom:1rem;cursor:pointer';
   const resetConfirmCheck = document.createElement('input');
@@ -1364,7 +1401,7 @@ export function buildUI(): void {
   resetButtonWrap.appendChild(btnResetDo);
   resetCard.appendChild(resetButtonWrap);
   resetCard.appendChild(makeLinkBtn('ログインに戻る', () => setActiveScreen('login')));
-  resetScreen.appendChild((resetCard as Record<string, unknown>)['__outerWrap'] as HTMLElement ?? resetCard);
+  resetScreen.appendChild((resetCard as unknown as { __outerWrap?: HTMLElement }).__outerWrap ?? resetCard);
 
   const chatScreen = createSection('会話画面');
   chatScreen.style.background = 'transparent';
@@ -1443,6 +1480,7 @@ export function buildUI(): void {
   };
 
   const syncChatLayout = (): void => {
+    const narrow = window.innerWidth < 640;
     if (window.innerWidth < 900) {
       isMobileChatLayout = true;
       chatShell.style.gridTemplateColumns = '1fr';
@@ -1458,13 +1496,16 @@ export function buildUI(): void {
       threadsPane.style.height = '100%';
       conversationPane.style.height = '100%';
     }
+    chatTopBar.style.padding = narrow ? '8px 10px' : '10px 14px';
+    chatTopBar.style.gap = narrow ? '8px' : '10px';
+    composerWrap.style.padding = narrow ? '8px 10px' : '10px 14px';
+    peerNameInput.style.maxWidth = narrow ? '130px' : '220px';
+    smsBody.style.fontSize = narrow ? '16px' : '14px';
     syncPaneVisibility();
     if (mobileBackButton) mobileBackButton.style.display = isMobileChatLayout ? '' : 'none';
     if (peerNameField) peerNameField.style.display = isMobileChatLayout ? 'none' : '';
     if (mobileOpenConversationButton) mobileOpenConversationButton.style.display = isMobileChatLayout ? '' : 'none';
   };
-  syncChatLayout();
-  window.addEventListener('resize', syncChatLayout);
 
   chatShell.appendChild(threadsPane);
   chatShell.appendChild(conversationPane);
@@ -1666,6 +1707,9 @@ export function buildUI(): void {
   composerWrap.appendChild(smsBody);
   composerWrap.appendChild(btnSendSMS);
   conversationPane.appendChild(composerWrap);
+
+  syncChatLayout();
+  window.addEventListener('resize', syncChatLayout);
 
   const callTitle = document.createElement('h3');
   callTitle.textContent = '電話（シグナリング）';
