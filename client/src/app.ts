@@ -1,7 +1,6 @@
 import {
   createButton,
   createInput,
-  createRow,
   createSection,
   styleInputBase,
   toErrorText,
@@ -487,13 +486,13 @@ async function encryptPrivateKey(privateKeyHex: string, password: string): Promi
   crypto.getRandomValues(ivArr);
   const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']);
   const aesKey = await crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt: saltArr.buffer, iterations: 100000, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt: saltArr.buffer as ArrayBuffer, iterations: 100000, hash: 'SHA-256' },
     keyMaterial,
     { name: 'AES-GCM', length: 256 },
     false,
     ['encrypt'],
   );
-  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: ivArr.buffer, tagLength: 128 }, aesKey, enc.encode(privateKeyHex));
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: ivArr.buffer as ArrayBuffer, tagLength: 128 }, aesKey, enc.encode(privateKeyHex));
   return `v1:${_bytesToHexLocal(saltArr)}:${_bytesToHexLocal(ivArr)}:${_bytesToHexLocal(new Uint8Array(ciphertext))}`;
 }
 
@@ -507,7 +506,7 @@ async function decryptPrivateKey(encrypted: string, password: string): Promise<s
   const enc = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']);
   const aesKey = await crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt: saltArr.buffer, iterations: 100000, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt: saltArr.buffer as ArrayBuffer, iterations: 100000, hash: 'SHA-256' },
     keyMaterial,
     { name: 'AES-GCM', length: 256 },
     false,
@@ -515,7 +514,7 @@ async function decryptPrivateKey(encrypted: string, password: string): Promise<s
   );
   let plaintext: ArrayBuffer;
   try {
-    plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivArr.buffer, tagLength: 128 }, aesKey, ciphertextArr.buffer);
+    plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivArr.buffer as ArrayBuffer, tagLength: 128 }, aesKey, ciphertextArr.buffer as ArrayBuffer);
   } catch (err) {
     console.debug('decryptPrivateKey failed:', err);
     throw new Error('パスワードが違います');
@@ -793,56 +792,6 @@ async function handleSignalAction(action: string, payload: unknown): Promise<voi
   }
 }
 
-function normalizeRoutingNumber(route: string): string {
-  const value = route.trim();
-  if (!/^\d{2}$/.test(value)) {
-    throw new Error('Routing Number は2桁（例: 02）で入力');
-  }
-  return value;
-}
-
-/** ニーモニックグリッドに24語を表示し、チェックボックスとボタンの連動も設定する */
-function generateAndShowMnemonic(
-  grid: HTMLElement,
-  statusEl: HTMLElement,
-  onKey: (hex: string) => void,
-  confirmCheck: HTMLInputElement,
-  submitBtn: HTMLButtonElement,
-): void {
-  grid.innerHTML = '';
-  grid.dataset['mnemonic'] = '';
-  statusEl.textContent = '生成中…';
-  confirmCheck.checked = false;
-  submitBtn.disabled = true;
-
-  generateMnemonic().then(({ privateKeyHex, mnemonic }) => {
-    onKey(privateKeyHex);
-    grid.dataset['mnemonic'] = mnemonic;
-    const words = mnemonic.split(' ');
-    words.forEach((word, i) => {
-      const cell = document.createElement('div');
-      cell.style.cssText =
-        'display:flex;align-items:center;gap:4px;padding:5px 8px;background:rgba(255,255,255,0.08);border-radius:8px;border:1px solid rgba(255,255,255,0.12);font-size:13px';
-      const num = document.createElement('span');
-      num.textContent = `${i + 1}.`;
-      num.style.cssText = 'min-width:20px;font-size:11px;color:rgba(255,255,255,0.4);text-align:right';
-      const wordSpan = document.createElement('span');
-      wordSpan.textContent = word;
-      wordSpan.style.cssText = 'font-family:monospace;font-weight:600;color:#e8e6ff';
-      cell.appendChild(num);
-      cell.appendChild(wordSpan);
-      grid.appendChild(cell);
-    });
-    statusEl.textContent = '上の24語を必ず控えてください';
-    statusEl.style.color = '#d9534f';
-  }).catch((err: unknown) => {
-    statusEl.textContent = `生成エラー: ${String(err)}`;
-  });
-
-  confirmCheck.onchange = () => {
-    submitBtn.disabled = !confirmCheck.checked;
-  };
-}
 
 export function buildUI(): void {
   const root = document.getElementById('app') ?? document.body;
@@ -1092,7 +1041,6 @@ export function buildUI(): void {
   signupScreen.style.cssText = 'width:100%;background:linear-gradient(135deg,#13111c 0%,#1d1b31 50%,#111827 100%);display:flex;justify-content:center;align-items:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
   const signupCard = makeCard('新規登録');
 
-  const signupRouteInput = createInput('signupRoute', 'ルーティング番号（2桁、例: 02）');
   const signupEmailInput = createInput('signupEmail', 'メールアドレス');
   signupEmailInput.type = 'email';
   signupEmailInput.autocomplete = 'email';
@@ -1111,7 +1059,6 @@ export function buildUI(): void {
   const signupStep2 = document.createElement('div');
   signupStep2.style.display = 'none';
 
-  signupStep1.appendChild(makeFormGroup('ルーティング番号', signupRouteInput));
   signupStep1.appendChild(makeFormGroup('メールアドレス', signupEmailInput));
 
   // Step2
@@ -1124,14 +1071,6 @@ export function buildUI(): void {
   signupConfirmCheck.style.display = 'none';
   signupConfirmCheck.checked = true; // パスワード登録では確認不要
 
-  const signupBtnRow = document.createElement('div');
-  signupBtnRow.style.cssText = 'display:flex;gap:8px;margin-bottom:0.8rem';
-
-  const resetBtnRow = document.createElement('div');
-  resetBtnRow.style.cssText = 'display:flex;gap:8px;margin-bottom:0.8rem';
-
-  const signupMnemonicGrid = document.createElement('div');
-  const signupMnemonicStatus = document.createElement('p');
 
   signupCard.appendChild(signupStep1);
   signupCard.appendChild(signupStep2);
@@ -1154,7 +1093,6 @@ export function buildUI(): void {
   resetScreen.style.cssText = 'width:100%;background:linear-gradient(135deg,#13111c 0%,#1d1b31 50%,#111827 100%);display:flex;justify-content:center;align-items:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
   const resetCard = makeCard('パスワード再設定');
 
-  const resetRouteInput = createInput('resetRoute', 'ルーティング番号（2桁、例: 02）');
   const resetEmailInput = createInput('resetEmail', 'メールアドレス');
   resetEmailInput.type = 'email';
   resetEmailInput.autocomplete = 'email';
@@ -1173,7 +1111,6 @@ export function buildUI(): void {
   const resetStep2 = document.createElement('div');
   resetStep2.style.display = 'none';
 
-  resetStep1.appendChild(makeFormGroup('ルーティング番号', resetRouteInput));
   resetStep1.appendChild(makeFormGroup('メールアドレス', resetEmailInput));
 
   resetStep2.appendChild(makeFormGroup('トークン', resetTokenInput));
@@ -1184,25 +1121,6 @@ export function buildUI(): void {
   resetConfirmCheck.type = 'checkbox';
   resetConfirmCheck.style.display = 'none';
   resetConfirmCheck.checked = true; // パスワード変更では確認不要
-
-  const resetMnemonicGrid = document.createElement('div');
-  const resetMnemonicStatus = document.createElement('p');
-
-  const syncResponsiveUI = (): void => {
-    const isNarrow = window.innerWidth < 640;
-
-    for (const screen of [loginScreen, signupScreen, resetScreen]) {
-      screen.style.alignItems = isNarrow ? 'flex-start' : 'center';
-      screen.style.padding = isNarrow ? '20px 12px 24px 12px' : '40px 16px';
-    }
-
-    for (const card of [loginCard, signupCard, resetCard]) {
-      card.style.padding = isNarrow ? '28px 20px 24px 20px' : '52px 48px 44px 48px';
-      card.style.borderRadius = isNarrow ? '18px' : '24px';
-    }
-
-    signupMnemonicGrid.style.gridTemplateColumns = isNarrow ? 'repeat(2,minmax(0,1fr))' : 'repeat(3,minmax(0,1fr))';
-    resetMnemonicGrid.style.gridTemplateColumns = isNarrow ? 'repeat(2,minmax(0,1fr))' : 'repeat(3,minmax(0,1fr))';
 
   const syncResponsiveUI = (): void => {
     const isNarrow = window.innerWidth < 640;
@@ -2055,10 +1973,6 @@ export function buildUI(): void {
 
   btnRegister.onclick = async () => {
     try {
-      const route = normalizeRoutingNumber(signupRouteInput.value);
-      const seed = await resolveSeed(route);
-      windowBase = seed.windowBase;
-      localStorage.setItem(LS_WINDOW_BASE, windowBase);
       await registerEmail(windowBase, signupEmailInput.value.trim());
       setStatus('確認メールを送信しました。トークンを入力してください。');
       signupStep1.style.display = 'none';
@@ -2087,10 +2001,6 @@ export function buildUI(): void {
         const { privateKeyHex } = await generateMnemonic();
         signupGeneratedKeyHex = privateKeyHex;
       }
-      const route = normalizeRoutingNumber(signupRouteInput.value);
-      const seed = await resolveSeed(route);
-      windowBase = seed.windowBase;
-      localStorage.setItem(LS_WINDOW_BASE, windowBase);
       const privateKeyHex = signupGeneratedKeyHex;
       const pubHex = derivePublicKeyHex(privateKeyHex);
       const encryptedKey = await encryptPrivateKey(privateKeyHex, password);
@@ -2109,10 +2019,6 @@ export function buildUI(): void {
 
   btnResetReq.onclick = async () => {
     try {
-      const route = normalizeRoutingNumber(resetRouteInput.value);
-      const seed = await resolveSeed(route);
-      windowBase = seed.windowBase;
-      localStorage.setItem(LS_WINDOW_BASE, windowBase);
       await resetRequest(windowBase, resetEmailInput.value.trim());
       setStatus('再設定メールを送信しました。トークンを入力してください。');
       resetStep1.style.display = 'none';
@@ -2140,10 +2046,6 @@ export function buildUI(): void {
         const { privateKeyHex } = await generateMnemonic();
         resetGeneratedKeyHex = privateKeyHex;
       }
-      const route = normalizeRoutingNumber(resetRouteInput.value);
-      const seed = await resolveSeed(route);
-      windowBase = seed.windowBase;
-      localStorage.setItem(LS_WINDOW_BASE, windowBase);
       const privateKeyHex = resetGeneratedKeyHex;
       const pubHex = derivePublicKeyHex(privateKeyHex);
       const encryptedKey = await encryptPrivateKey(privateKeyHex, password);
@@ -2292,5 +2194,4 @@ export function buildUI(): void {
     loginEmailInput.value = savedEmail;
     setStatus('メールアドレスとパスワードを入力してログインしてください。');
   }
-}
 }
