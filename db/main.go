@@ -64,11 +64,26 @@ func initDB() error {
 		email VARCHAR(255) PRIMARY KEY,
 		number VARCHAR(128) UNIQUE NOT NULL,
 		public_key CHAR(128) NOT NULL,
+		password_hash VARCHAR(255) NOT NULL DEFAULT '',
+		encrypted_key TEXT NOT NULL DEFAULT '',
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		INDEX idx_number (number),
 		INDEX idx_pubkey (public_key)
 	)
 	`)
+	if err != nil {
+		return err
+	}
+	// 既存テーブルへのカラム追加（移行対応）
+	for _, col := range []string{
+		"ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255) NOT NULL DEFAULT ''",
+		"ALTER TABLE users ADD COLUMN IF NOT EXISTS encrypted_key TEXT NOT NULL DEFAULT ''",
+	} {
+		if _, err := db.Exec(col); err != nil {
+			// 既にカラムが存在する場合は無視する（MySQL 8.0 以前は IF NOT EXISTS 非対応）
+			_ = err
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -483,9 +498,11 @@ func handleDBWS(w http.ResponseWriter, r *http.Request) {
 
 		case "users.create":
 			var in struct {
-				Email     string `json:"email"`
-				PublicKey string `json:"public_key"`
-				Route     string `json:"route"`
+				Email        string `json:"email"`
+				PublicKey    string `json:"public_key"`
+				Route        string `json:"route"`
+				PasswordHash string `json:"password_hash"`
+				EncryptedKey string `json:"encrypted_key"`
 			}
 			if err := json.Unmarshal(req.Data, &in); err != nil || in.Email == "" || in.PublicKey == "" {
 				writeWSError(conn, "missing email or public_key")
@@ -496,7 +513,10 @@ func handleDBWS(w http.ResponseWriter, r *http.Request) {
 				writeWSError(conn, "failed to generate number")
 				continue
 			}
-			if _, err := db.Exec("INSERT INTO users (email, number, public_key) VALUES (?, ?, ?)", in.Email, number, in.PublicKey); err != nil {
+			if _, err := db.Exec(
+				"INSERT INTO users (email, number, public_key, password_hash, encrypted_key) VALUES (?, ?, ?, ?, ?)",
+				in.Email, number, in.PublicKey, in.PasswordHash, in.EncryptedKey,
+			); err != nil {
 				writeWSError(conn, "create failed")
 				continue
 			}
@@ -519,8 +539,10 @@ func handleDBWS(w http.ResponseWriter, r *http.Request) {
 
 		case "users.updatePubkey":
 			var in struct {
-				Email     string `json:"email"`
-				PublicKey string `json:"public_key"`
+				Email        string `json:"email"`
+				PublicKey    string `json:"public_key"`
+				PasswordHash string `json:"password_hash"`
+				EncryptedKey string `json:"encrypted_key"`
 			}
 			if err := json.Unmarshal(req.Data, &in); err != nil || in.Email == "" || in.PublicKey == "" {
 				writeWSError(conn, "missing email or public_key")
@@ -531,11 +553,37 @@ func handleDBWS(w http.ResponseWriter, r *http.Request) {
 				writeWSError(conn, "user not found")
 				continue
 			}
-			if _, err := db.Exec("UPDATE users SET public_key = ? WHERE email = ?", in.PublicKey, in.Email); err != nil {
+			if _, err := db.Exec(
+				"UPDATE users SET public_key = ?, password_hash = ?, encrypted_key = ? WHERE email = ?",
+				in.PublicKey, in.PasswordHash, in.EncryptedKey, in.Email,
+			); err != nil {
 				writeWSError(conn, "update failed")
 				continue
 			}
 			_ = conn.WriteJSON(map[string]any{"ok": true, "data": map[string]string{"number": number}})
+
+		case "users.getAuthInfo":
+			var in struct {
+				Email string `json:"email"`
+			}
+			if err := json.Unmarshal(req.Data, &in); err != nil || in.Email == "" {
+				writeWSError(conn, "missing email")
+				continue
+			}
+			var number, pubkey, passwordHash, encryptedKey string
+			if err := db.QueryRow(
+				"SELECT number, public_key, password_hash, encrypted_key FROM users WHERE email = ?",
+				in.Email,
+			).Scan(&number, &pubkey, &passwordHash, &encryptedKey); err != nil {
+				writeWSError(conn, "user not found")
+				continue
+			}
+			_ = conn.WriteJSON(map[string]any{"ok": true, "data": map[string]string{
+				"number":        number,
+				"public_key":    pubkey,
+				"password_hash": passwordHash,
+				"encrypted_key": encryptedKey,
+			}})
 
 		default:
 			writeWSError(conn, "unknown action")

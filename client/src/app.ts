@@ -6,10 +6,11 @@ import {
   styleInputBase,
   toErrorText,
 } from './dom';
-import { generateMnemonic, mnemonicToPrivateKeyHex } from './mnemonic';
+import { generateMnemonic } from './mnemonic';
 import {
   createAccount,
   getPublicKeyByNumber,
+  loginAccount,
   registerEmail,
   resolveSeed,
   sendCallAuthChallenge,
@@ -31,12 +32,12 @@ let windowBase = 'https://WINDOW_SERVER_HOST:30000';
 let nodeWsUrl = '';
 let nodeSocket: WebSocket | null = null;
 let currentNumber = '';
-let currentChallenge = '';
 let isAuthenticated = false;
 // currentPrivateKeyHex はセッション中のみメモリに保持する秘密鍵（永続化しない）。
 // persist=off の場合でも通話認証・SMS署名に使用できるようにする。
 let currentPrivateKeyHex = '';
-let pendingChallengeResolver: ((challenge: string) => void) | null = null;
+// currentJWT はセッション中のみメモリに保持するJWTトークン（永続化しない）。
+let currentJWT = '';
 let pendingAuthResolver: (() => void) | null = null;
 
 let statusNode: HTMLDivElement | null = null;
@@ -83,10 +84,8 @@ let lastToastCount = 0;
 const LS_WINDOW_BASE = 'smsandtell.windowBase';
 const LS_NUMBER = 'smsandtell.number';
 const LS_PHONE_NUMBER = 'smsandtell.phoneNumber';
+const LS_EMAIL = 'smsandtell.email';
 const LS_PRIVATE_KEY = 'smsandtell.privateKey'; // legacy: plain-text key (migration only)
-const LS_ENCRYPTED_KEY = 'smsandtell.encryptedKey'; // v1:<saltHex>:<ivHex>:<ciphertextHex>
-const LS_PUBLIC_KEY = 'smsandtell.publicKey';
-const LS_PERSIST_SENSITIVE = 'smsandtell.persistSensitive';
 const CHAT_DB_NAME = 'smsandtell-chat';
 const CHAT_DB_VERSION = 1;
 const CHAT_DB_STORE = 'threads';
@@ -271,7 +270,7 @@ function closeNodeWS(): void {
   }
   isAuthenticated = false;
   currentPrivateKeyHex = '';
-  pendingChallengeResolver = null;
+  currentJWT = '';
   pendingAuthResolver = null;
   pendingCallAuth = null;
   cleanupCall();
@@ -282,7 +281,7 @@ function closeNodeWS(): void {
   }
 }
 
-function openNodeWS(number: string): Promise<void> {
+function openNodeWS(number: string, jwt: string): Promise<void> {
   return new Promise((resolve, reject) => {
     closeNodeWS();
 
@@ -293,7 +292,8 @@ function openNodeWS(number: string): Promise<void> {
 
     const ws = new WebSocket(nodeWsUrl);
     ws.onopen = () => {
-      ws.send(number);
+      // JWT認証メッセージを送信する
+      ws.send(JSON.stringify({ action: 'auth', number, token: jwt }));
       nodeSocket = ws;
       resolve();
     };
@@ -311,7 +311,7 @@ function openNodeWS(number: string): Promise<void> {
       nodeSocket = null;
       if (isAuthenticated) {
         isAuthenticated = false;
-        pendingChallengeResolver = null;
+        currentJWT = '';
         pendingAuthResolver = null;
         pendingCallAuth = null;
         cleanupCall();
@@ -328,16 +328,6 @@ function openNodeWS(number: string): Promise<void> {
         data = JSON.parse(String(event.data)) as NodeInbound;
       } catch {
         // サーバーから不正なJSONが届いた場合は無視して接続を維持する
-        return;
-      }
-
-      if (data.challenge) {
-        currentChallenge = String(data.challenge);
-        if (pendingChallengeResolver) {
-          pendingChallengeResolver(currentChallenge);
-          pendingChallengeResolver = null;
-        }
-        setStatus('challenge received');
         return;
       }
 
@@ -395,50 +385,6 @@ function openNodeWS(number: string): Promise<void> {
         setErrorStatus(`node error: ${String(data.error)}`);
       }
     };
-  });
-}
-
-function requestChallenge(): void {
-  if (!nodeSocket) {
-    setStatus('ws not connected');
-    return;
-  }
-  nodeSocket.send(JSON.stringify({ action: 'challenge' }));
-}
-
-function sendAuthVerify(signatureHex: string): void {
-  if (!nodeSocket) {
-    setStatus('ws not connected');
-    return;
-  }
-  if (!currentChallenge) {
-    setStatus('challenge not ready');
-    return;
-  }
-  nodeSocket.send(
-    JSON.stringify({
-      action: 'auth_verify',
-      challenge: currentChallenge,
-      sig: signatureHex,
-    }),
-  );
-}
-
-function requestChallengeOnce(timeoutMs = 6000): Promise<string> {
-  return new Promise((resolve, reject) => {
-    if (!nodeSocket) {
-      reject(new Error('ws not connected'));
-      return;
-    }
-    const timer = setTimeout(() => {
-      pendingChallengeResolver = null;
-      reject(new Error('challenge timeout'));
-    }, timeoutMs);
-    pendingChallengeResolver = (challenge: string) => {
-      clearTimeout(timer);
-      resolve(challenge);
-    };
-    requestChallenge();
   });
 }
 
@@ -1122,123 +1068,20 @@ export function buildUI(): void {
   loginScreen.style.cssText = 'width:100%;background:linear-gradient(135deg,#13111c 0%,#1d1b31 50%,#111827 100%);display:flex;justify-content:center;align-items:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
   const loginCard = makeCard('ログイン');
 
-  const numberInput = createInput('number', '番号 (例: 02-xxxxxxxx)', localStorage.getItem(LS_PHONE_NUMBER) ?? localStorage.getItem(LS_NUMBER) ?? '');
-  const privateKeyInput = createInput('privateKey', '秘密鍵 (hex)');
-  privateKeyInput.type = 'password';
-  privateKeyInput.autocomplete = 'off';
-  let privateKeyMaskTimer: number | null = null;
+  const loginEmailInput = createInput('loginEmail', 'メールアドレス');
+  loginEmailInput.type = 'email';
+  loginEmailInput.autocomplete = 'email';
+  loginEmailInput.value = localStorage.getItem(LS_EMAIL) ?? '';
 
-  // --- メインセクション: 番号 + ニーモニック ---
-  loginCard.appendChild(makeFormGroup('番号', numberInput));
+  const loginPasswordInput = createInput('loginPassword', 'パスワード');
+  loginPasswordInput.type = 'password';
+  loginPasswordInput.autocomplete = 'current-password';
 
-  // ニーモニック入力（メイン）
-  const mnemonicLoginGroup = document.createElement('div');
-  mnemonicLoginGroup.style.marginBottom = '1.2rem';
-  const mnemonicLoginLabel = document.createElement('label');
-  mnemonicLoginLabel.textContent = 'ニーモニック';
-  mnemonicLoginLabel.style.cssText = 'display:block;margin-bottom:0.4rem;font-weight:600;font-size:12px;color:#aaa;text-transform:uppercase';
-  const mnemonicLoginTextarea = document.createElement('textarea');
-  mnemonicLoginTextarea.id = 'mnemonicLogin';
-  mnemonicLoginTextarea.placeholder = '24語のニーモニックをスペース区切りで入力…';
-  mnemonicLoginTextarea.rows = 3;
-  mnemonicLoginTextarea.style.cssText = 'width:100%;box-sizing:border-box;border:none;border-radius:15px;padding:12px 16px;font-size:13px;font-family:monospace;resize:vertical;background:rgba(255,255,255,.1);color:#fff;outline:none';
-  mnemonicLoginTextarea.addEventListener('focus', () => { mnemonicLoginTextarea.style.background = 'rgba(255,255,255,.18)'; });
-  mnemonicLoginTextarea.addEventListener('blur', () => { mnemonicLoginTextarea.style.background = 'rgba(255,255,255,.1)'; });
-  mnemonicLoginGroup.appendChild(mnemonicLoginLabel);
-  mnemonicLoginGroup.appendChild(mnemonicLoginTextarea);
-  loginCard.appendChild(mnemonicLoginGroup);
-
-  // 端末に保存
-  const persistSensitiveLabel = document.createElement('label');
-  persistSensitiveLabel.style.display = 'inline-flex';
-  persistSensitiveLabel.style.alignItems = 'center';
-  persistSensitiveLabel.style.gap = '6px';
-  persistSensitiveLabel.style.fontSize = '12px';
-  persistSensitiveLabel.style.color = 'rgba(255,255,255,.7)';
-  persistSensitiveLabel.style.marginBottom = '0.6rem';
-  const persistSensitiveCheck = document.createElement('input');
-  persistSensitiveCheck.type = 'checkbox';
-  persistSensitiveCheck.checked = (localStorage.getItem(LS_PERSIST_SENSITIVE) ?? '1') !== '0';
-  const persistSensitiveText = document.createElement('span');
-  persistSensitiveText.textContent = '端末に保存';
-  persistSensitiveLabel.appendChild(persistSensitiveCheck);
-  persistSensitiveLabel.appendChild(persistSensitiveText);
-  loginCard.appendChild(persistSensitiveLabel);
-
-  // 保存用パスワード（端末に保存チェック時のみ表示）
-  const savePasswordInput = createInput('savePassword', 'パスワード（保存・復元に使用）');
-  savePasswordInput.type = 'password';
-  savePasswordInput.autocomplete = 'new-password';
-  const savePasswordGroup = makeFormGroup('保存パスワード', savePasswordInput);
-  savePasswordGroup.style.marginBottom = '1.2rem';
-  const hasSavedEncryptedKey = !!localStorage.getItem(LS_ENCRYPTED_KEY);
-  savePasswordGroup.style.display = (persistSensitiveCheck.checked || hasSavedEncryptedKey) ? 'block' : 'none';
-  loginCard.appendChild(savePasswordGroup);
-  persistSensitiveCheck.addEventListener('change', () => {
-    savePasswordGroup.style.display = persistSensitiveCheck.checked ? 'block' : 'none';
-  });
+  loginCard.appendChild(makeFormGroup('メールアドレス', loginEmailInput));
+  loginCard.appendChild(makeFormGroup('パスワード', loginPasswordInput));
 
   const btnLookupConnect = makePrimaryBtn('btnLookupConnect', 'ログイン');
   loginCard.appendChild(btnLookupConnect);
-
-  // HR 区切り線
-  const loginHr = document.createElement('div');
-  loginHr.style.cssText = 'height:2px;margin:30px 0 20px 0;background:rgba(255,255,255,.2)';
-  loginCard.appendChild(loginHr);
-
-  // --- サブセクション: 秘密鍵で直接ログイン（折りたたみ）---
-  const privateKeyToggle = document.createElement('button');
-  privateKeyToggle.type = 'button';
-  privateKeyToggle.textContent = '▶ 秘密鍵で直接ログインする';
-  privateKeyToggle.style.cssText = 'border:none;background:transparent;color:rgba(255,255,255,.7);cursor:pointer;font-size:13px;padding:0;margin-bottom:0.5rem;text-align:left;width:100%';
-
-  const privateKeySection = document.createElement('div');
-  privateKeySection.style.display = 'none';
-  privateKeySection.style.marginBottom = '1rem';
-
-  privateKeySection.appendChild(makeFormGroup('秘密鍵', privateKeyInput));
-
-  const privateKeyControl = document.createElement('div');
-  privateKeyControl.style.marginBottom = '1rem';
-  privateKeyControl.style.display = 'flex';
-  privateKeyControl.style.alignItems = 'center';
-  privateKeyControl.style.gap = '10px';
-
-  const btnTogglePrivateKey = document.createElement('button');
-  btnTogglePrivateKey.type = 'button';
-  btnTogglePrivateKey.textContent = '秘密鍵を表示';
-  btnTogglePrivateKey.style.border = 'none';
-  btnTogglePrivateKey.style.background = 'transparent';
-  btnTogglePrivateKey.style.color = 'rgba(255,255,255,.7)';
-  btnTogglePrivateKey.style.cursor = 'pointer';
-  btnTogglePrivateKey.style.fontSize = '13px';
-  btnTogglePrivateKey.style.padding = '0';
-  btnTogglePrivateKey.onclick = () => {
-    const isHidden = privateKeyInput.type === 'password';
-    privateKeyInput.type = isHidden ? 'text' : 'password';
-    btnTogglePrivateKey.textContent = isHidden ? '秘密鍵を隠す' : '秘密鍵を表示';
-  };
-  privateKeyInput.addEventListener('paste', () => {
-    if (privateKeyMaskTimer) clearTimeout(privateKeyMaskTimer);
-    privateKeyInput.type = 'text';
-    btnTogglePrivateKey.textContent = '秘密鍵を隠す';
-    privateKeyMaskTimer = window.setTimeout(() => {
-      privateKeyInput.type = 'password';
-      btnTogglePrivateKey.textContent = '秘密鍵を表示';
-    }, 5000);
-  });
-  privateKeyControl.appendChild(btnTogglePrivateKey);
-  privateKeySection.appendChild(privateKeyControl);
-
-  privateKeyToggle.onclick = () => {
-    const shown = privateKeySection.style.display !== 'none';
-    privateKeySection.style.display = shown ? 'none' : 'block';
-    privateKeyToggle.textContent = shown
-      ? '▶ 秘密鍵で直接ログインする'
-      : '▼ 秘密鍵で直接ログインする';
-  };
-  loginCard.appendChild(privateKeyToggle);
-  loginCard.appendChild(privateKeySection);
 
   loginCard.appendChild(makeLinkBtn('新規登録はこちら', () => setActiveScreen('signup')));
   loginCard.appendChild(makeLinkBtn('パスワードを忘れた方', () => setActiveScreen('reset')));
@@ -1251,7 +1094,15 @@ export function buildUI(): void {
 
   const signupRouteInput = createInput('signupRoute', 'ルーティング番号（2桁、例: 02）');
   const signupEmailInput = createInput('signupEmail', 'メールアドレス');
+  signupEmailInput.type = 'email';
+  signupEmailInput.autocomplete = 'email';
   const signupTokenInput = createInput('signupToken', 'メールのトークン');
+  const signupPasswordInput = createInput('signupPassword', 'パスワード（8文字以上）');
+  signupPasswordInput.type = 'password';
+  signupPasswordInput.autocomplete = 'new-password';
+  const signupPasswordConfirmInput = createInput('signupPasswordConfirm', 'パスワード（確認）');
+  signupPasswordConfirmInput.type = 'password';
+  signupPasswordConfirmInput.autocomplete = 'new-password';
 
   // 生成した秘密鍵を一時保存（入力フィールドには出さない）
   let signupGeneratedKeyHex = '';
@@ -1263,70 +1114,24 @@ export function buildUI(): void {
   signupStep1.appendChild(makeFormGroup('ルーティング番号', signupRouteInput));
   signupStep1.appendChild(makeFormGroup('メールアドレス', signupEmailInput));
 
-  // Step2 – ニーモニック表示 UI
-  const signupStep2Note = document.createElement('p');
-  signupStep2Note.innerHTML =
-    '新しい秘密鍵を自動生成しました。<br>' +
-    '<strong>以下の24語のニーモニックを紙などに控えてください。</strong><br>' +
-    'このニーモニックがないと秘密鍵を復元できません。';
-  signupStep2Note.style.cssText = 'margin:0 0 0.8rem 0;font-size:13px;color:#ddd;line-height:1.5';
-  signupStep2.appendChild(signupStep2Note);
+  // Step2
   signupStep2.appendChild(makeFormGroup('トークン', signupTokenInput));
+  signupStep2.appendChild(makeFormGroup('パスワード', signupPasswordInput));
+  signupStep2.appendChild(makeFormGroup('パスワード（確認）', signupPasswordConfirmInput));
 
-  // ニーモニック表示グリッド
-  const signupMnemonicGrid = document.createElement('div');
-  signupMnemonicGrid.style.cssText =
-    'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 0.6rem 0;background:rgba(255,255,255,0.05);border-radius:14px;padding:12px;border:1px solid rgba(255,255,255,0.08)';
-  const signupMnemonicStatus = document.createElement('p');
-  signupMnemonicStatus.textContent = '生成中…';
-  signupMnemonicStatus.style.cssText = 'font-size:12px;color:rgba(255,255,255,.6);margin:0 0 0.5rem 0;text-align:center';
-  signupStep2.appendChild(signupMnemonicGrid);
-  signupStep2.appendChild(signupMnemonicStatus);
-
-  // コピーボタン
-  const btnSignupCopyMnemonic = document.createElement('button');
-  btnSignupCopyMnemonic.type = 'button';
-  btnSignupCopyMnemonic.textContent = 'ニーモニックをコピー';
-  btnSignupCopyMnemonic.style.cssText =
-    'border:1px solid rgba(255,255,255,.5);background:transparent;color:rgba(255,255,255,.8);border-radius:25px;padding:6px 14px;cursor:pointer;font-size:13px;margin-right:8px';
-  btnSignupCopyMnemonic.onclick = () => {
-    navigator.clipboard.writeText(signupMnemonicGrid.dataset['mnemonic'] ?? '').then(() => {
-      btnSignupCopyMnemonic.textContent = 'コピー済み ✓';
-      setTimeout(() => { btnSignupCopyMnemonic.textContent = 'ニーモニックをコピー'; }, 2000);
-    });
-  };
-
-  // 再生成ボタン
-  const btnSignupRegen = document.createElement('button');
-  btnSignupRegen.type = 'button';
-  btnSignupRegen.textContent = '再生成';
-  btnSignupRegen.style.cssText =
-    'border:1px solid rgba(255,255,255,.3);background:transparent;color:rgba(255,255,255,.6);border-radius:25px;padding:6px 14px;cursor:pointer;font-size:13px';
-  btnSignupRegen.onclick = () => {
-    generateAndShowMnemonic(
-      signupMnemonicGrid, signupMnemonicStatus,
-      (hex) => { signupGeneratedKeyHex = hex; },
-      signupConfirmCheck, btnCreate,
-    );
-  };
+  const signupConfirmCheck = document.createElement('input');
+  signupConfirmCheck.type = 'checkbox';
+  signupConfirmCheck.style.display = 'none';
+  signupConfirmCheck.checked = true; // パスワード登録では確認不要
 
   const signupBtnRow = document.createElement('div');
   signupBtnRow.style.cssText = 'display:flex;gap:8px;margin-bottom:0.8rem';
-  signupBtnRow.appendChild(btnSignupCopyMnemonic);
-  signupBtnRow.appendChild(btnSignupRegen);
-  signupStep2.appendChild(signupBtnRow);
 
-  // 確認チェックボックス
-  const signupConfirmLabel = document.createElement('label');
-  signupConfirmLabel.style.cssText = 'display:flex;align-items:flex-start;gap:6px;font-size:13px;color:#ddd;margin-bottom:1rem;cursor:pointer';
-  const signupConfirmCheck = document.createElement('input');
-  signupConfirmCheck.type = 'checkbox';
-  signupConfirmCheck.style.marginTop = '2px';
-  const signupConfirmText = document.createElement('span');
-  signupConfirmText.textContent = 'ニーモニックを安全な場所に控えました（このニーモニックが唯一のバックアップです）';
-  signupConfirmLabel.appendChild(signupConfirmCheck);
-  signupConfirmLabel.appendChild(signupConfirmText);
-  signupStep2.appendChild(signupConfirmLabel);
+  const resetBtnRow = document.createElement('div');
+  resetBtnRow.style.cssText = 'display:flex;gap:8px;margin-bottom:0.8rem';
+
+  const signupMnemonicGrid = document.createElement('div');
+  const signupMnemonicStatus = document.createElement('p');
 
   signupCard.appendChild(signupStep1);
   signupCard.appendChild(signupStep2);
@@ -1347,11 +1152,19 @@ export function buildUI(): void {
   // --- 再設定画面 ---
   const resetScreen = document.createElement('div');
   resetScreen.style.cssText = 'width:100%;background:linear-gradient(135deg,#13111c 0%,#1d1b31 50%,#111827 100%);display:flex;justify-content:center;align-items:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
-  const resetCard = makeCard('秘密鍵の再設定');
+  const resetCard = makeCard('パスワード再設定');
 
   const resetRouteInput = createInput('resetRoute', 'ルーティング番号（2桁、例: 02）');
   const resetEmailInput = createInput('resetEmail', 'メールアドレス');
+  resetEmailInput.type = 'email';
+  resetEmailInput.autocomplete = 'email';
   const resetTokenInput = createInput('resetToken', '再設定トークン');
+  const resetPasswordInput = createInput('resetPassword', '新しいパスワード（8文字以上）');
+  resetPasswordInput.type = 'password';
+  resetPasswordInput.autocomplete = 'new-password';
+  const resetPasswordConfirmInput = createInput('resetPasswordConfirm', '新しいパスワード（確認）');
+  resetPasswordConfirmInput.type = 'password';
+  resetPasswordConfirmInput.autocomplete = 'new-password';
 
   // 生成した新しい秘密鍵を一時保存
   let resetGeneratedKeyHex = '';
@@ -1363,55 +1176,17 @@ export function buildUI(): void {
   resetStep1.appendChild(makeFormGroup('ルーティング番号', resetRouteInput));
   resetStep1.appendChild(makeFormGroup('メールアドレス', resetEmailInput));
 
-  // Step2 – ニーモニック表示 UI
-  const resetStep2Note = document.createElement('p');
-  resetStep2Note.innerHTML =
-    '新しい秘密鍵を自動生成しました。<br>' +
-    '<strong>以下の24語のニーモニックを紙などに控えてください。</strong><br>' +
-    'このニーモニックがないと秘密鍵を復元できません。';
-  resetStep2Note.style.cssText = 'margin:0 0 0.8rem 0;font-size:13px;color:#ddd;line-height:1.5';
-  resetStep2.appendChild(resetStep2Note);
   resetStep2.appendChild(makeFormGroup('トークン', resetTokenInput));
+  resetStep2.appendChild(makeFormGroup('新しいパスワード', resetPasswordInput));
+  resetStep2.appendChild(makeFormGroup('新しいパスワード（確認）', resetPasswordConfirmInput));
+
+  const resetConfirmCheck = document.createElement('input');
+  resetConfirmCheck.type = 'checkbox';
+  resetConfirmCheck.style.display = 'none';
+  resetConfirmCheck.checked = true; // パスワード変更では確認不要
 
   const resetMnemonicGrid = document.createElement('div');
-  resetMnemonicGrid.style.cssText =
-    'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 0.6rem 0;background:rgba(255,255,255,0.05);border-radius:14px;padding:12px;border:1px solid rgba(255,255,255,0.08)';
   const resetMnemonicStatus = document.createElement('p');
-  resetMnemonicStatus.textContent = '生成中…';
-  resetMnemonicStatus.style.cssText = 'font-size:12px;color:rgba(255,255,255,.6);margin:0 0 0.5rem 0;text-align:center';
-  resetStep2.appendChild(resetMnemonicGrid);
-  resetStep2.appendChild(resetMnemonicStatus);
-
-  const btnResetCopyMnemonic = document.createElement('button');
-  btnResetCopyMnemonic.type = 'button';
-  btnResetCopyMnemonic.textContent = 'ニーモニックをコピー';
-  btnResetCopyMnemonic.style.cssText =
-    'border:1px solid rgba(255,255,255,.5);background:transparent;color:rgba(255,255,255,.8);border-radius:25px;padding:6px 14px;cursor:pointer;font-size:13px;margin-right:8px';
-  btnResetCopyMnemonic.onclick = () => {
-    navigator.clipboard.writeText(resetMnemonicGrid.dataset['mnemonic'] ?? '').then(() => {
-      btnResetCopyMnemonic.textContent = 'コピー済み ✓';
-      setTimeout(() => { btnResetCopyMnemonic.textContent = 'ニーモニックをコピー'; }, 2000);
-    });
-  };
-
-  const btnResetRegen = document.createElement('button');
-  btnResetRegen.type = 'button';
-  btnResetRegen.textContent = '再生成';
-  btnResetRegen.style.cssText =
-    'border:1px solid rgba(255,255,255,.3);background:transparent;color:rgba(255,255,255,.6);border-radius:25px;padding:6px 14px;cursor:pointer;font-size:13px';
-  btnResetRegen.onclick = () => {
-    generateAndShowMnemonic(
-      resetMnemonicGrid, resetMnemonicStatus,
-      (hex) => { resetGeneratedKeyHex = hex; },
-      resetConfirmCheck, btnResetDo,
-    );
-  };
-
-  const resetBtnRow = document.createElement('div');
-  resetBtnRow.style.cssText = 'display:flex;gap:8px;margin-bottom:0.8rem';
-  resetBtnRow.appendChild(btnResetCopyMnemonic);
-  resetBtnRow.appendChild(btnResetRegen);
-  resetStep2.appendChild(resetBtnRow);
 
   const syncResponsiveUI = (): void => {
     const isNarrow = window.innerWidth < 640;
@@ -1429,14 +1204,19 @@ export function buildUI(): void {
     signupMnemonicGrid.style.gridTemplateColumns = isNarrow ? 'repeat(2,minmax(0,1fr))' : 'repeat(3,minmax(0,1fr))';
     resetMnemonicGrid.style.gridTemplateColumns = isNarrow ? 'repeat(2,minmax(0,1fr))' : 'repeat(3,minmax(0,1fr))';
 
-    for (const row of [signupBtnRow, resetBtnRow]) {
-      row.style.flexWrap = isNarrow ? 'wrap' : 'nowrap';
-    }
-    for (const btn of [btnSignupCopyMnemonic, btnSignupRegen, btnResetCopyMnemonic, btnResetRegen]) {
-      btn.style.flex = isNarrow ? '1 1 calc(50% - 4px)' : '0 0 auto';
+  const syncResponsiveUI = (): void => {
+    const isNarrow = window.innerWidth < 640;
+
+    for (const screen of [loginScreen, signupScreen, resetScreen]) {
+      screen.style.alignItems = isNarrow ? 'flex-start' : 'center';
+      screen.style.padding = isNarrow ? '20px 12px 24px 12px' : '40px 16px';
     }
 
-    privateKeyControl.style.flexWrap = isNarrow ? 'wrap' : 'nowrap';
+    for (const card of [loginCard, signupCard, resetCard]) {
+      card.style.padding = isNarrow ? '28px 20px 24px 20px' : '52px 48px 44px 48px';
+      card.style.borderRadius = isNarrow ? '18px' : '24px';
+    }
+
     if (toastHostNode) {
       toastHostNode.style.left = isNarrow ? '12px' : '';
       toastHostNode.style.right = isNarrow ? '12px' : '14px';
@@ -1446,17 +1226,6 @@ export function buildUI(): void {
 
   syncResponsiveUI();
   window.addEventListener('resize', syncResponsiveUI);
-
-  const resetConfirmLabel = document.createElement('label');
-  resetConfirmLabel.style.cssText = 'display:flex;align-items:flex-start;gap:6px;font-size:13px;color:#ddd;margin-bottom:1rem;cursor:pointer';
-  const resetConfirmCheck = document.createElement('input');
-  resetConfirmCheck.type = 'checkbox';
-  resetConfirmCheck.style.marginTop = '2px';
-  const resetConfirmText = document.createElement('span');
-  resetConfirmText.textContent = 'ニーモニックを安全な場所に控えました（このニーモニックが唯一のバックアップです）';
-  resetConfirmLabel.appendChild(resetConfirmCheck);
-  resetConfirmLabel.appendChild(resetConfirmText);
-  resetStep2.appendChild(resetConfirmLabel);
 
   resetCard.appendChild(resetStep1);
   resetCard.appendChild(resetStep2);
@@ -2197,7 +1966,6 @@ export function buildUI(): void {
   disconnectXButton.style.backdropFilter = 'blur(8px)';
   disconnectXButton.onclick = () => {
     closeNodeWS();
-    currentChallenge = '';
     pendingCallAuth = null;
     setStatus('disconnected');
   };
@@ -2213,85 +1981,61 @@ export function buildUI(): void {
     if (isLoggingIn) throw new Error('ログイン処理中です。完了をお待ちください');
     isLoggingIn = true;
     try {
-    currentNumber = numberInput.value.trim();
-    const mnemonicValue = mnemonicLoginTextarea.value.trim();
-    let privateKeyHex: string;
-    if (mnemonicValue) {
-      privateKeyHex = await mnemonicToPrivateKeyHex(mnemonicValue);
-    } else if (privateKeyInput.value.trim()) {
-      privateKeyHex = normalizePrivateKeyHex(privateKeyInput.value);
-    } else {
-      // 保存済みの暗号化鍵を復元する
-      const savedEncrypted = localStorage.getItem(LS_ENCRYPTED_KEY) ?? '';
-      if (!savedEncrypted) throw new Error('秘密鍵またはニーモニックを入力してください');
-      const password = savePasswordInput.value;
-      if (!password) throw new Error('保存済みの鍵を使うにはパスワードを入力してください');
-      privateKeyHex = normalizePrivateKeyHex(await decryptPrivateKey(savedEncrypted, password));
-    }
+      const email = loginEmailInput.value.trim();
+      const password = loginPasswordInput.value;
+      if (!email) throw new Error('メールアドレスを入力してください');
+      if (!password) throw new Error('パスワードを入力してください');
 
-    if (!currentNumber) {
-      throw new Error('number は必須');
-    }
+      // window サーバーを解決する（ルーティング番号からDNSを引く）
+      // メールの @ 前部分からルーティングを推定することは難しいため、
+      // まずデフォルトの windowBase を使ってログインを試みる。
+      const savedWindowBase = localStorage.getItem(LS_WINDOW_BASE) ?? windowBase;
+      windowBase = savedWindowBase;
 
-    // セッション中のみメモリに保持（persist=offでも通話認証・SMS署名で使用）
-    currentPrivateKeyHex = privateKeyHex;
+      if (!opts?.silent) setStatus('ログイン中...');
+      const loginResult = await loginAccount(windowBase, email, password);
 
-    localStorage.setItem(LS_PERSIST_SENSITIVE, persistSensitiveCheck.checked ? '1' : '0');
-    if (persistSensitiveCheck.checked) {
-      const password = savePasswordInput.value;
-      if (!password) throw new Error('端末保存にはパスワードを入力してください');
-      validateSavePassword(password);
-      const encrypted = await encryptPrivateKey(privateKeyHex, password);
-      localStorage.setItem(LS_ENCRYPTED_KEY, encrypted);
-    } else {
-      localStorage.removeItem(LS_ENCRYPTED_KEY);
-      localStorage.removeItem(LS_PUBLIC_KEY);
-    }
-    const derivedPubHex = derivePublicKeyHex(privateKeyHex);
-    if (persistSensitiveCheck.checked) {
-      localStorage.setItem(LS_PUBLIC_KEY, derivedPubHex);
-    }
+      currentNumber = loginResult.number;
+      currentJWT = loginResult.token;
+      const encryptedKey = loginResult.encrypted_key;
 
-    const seed = await resolveSeed(currentNumber);
-    windowBase = seed.windowBase;
-    localStorage.setItem(LS_WINDOW_BASE, windowBase);
+      if (!encryptedKey) throw new Error('サーバーから鍵データが返されませんでした。再登録してください。');
+      const privateKeyHex = normalizePrivateKeyHex(await decryptPrivateKey(encryptedKey, password));
+      currentPrivateKeyHex = privateKeyHex;
 
-    if (persistSensitiveCheck.checked) {
+      localStorage.setItem(LS_EMAIL, email);
       localStorage.setItem(LS_NUMBER, currentNumber);
       localStorage.setItem(LS_PHONE_NUMBER, currentNumber);
-    } else {
-      localStorage.removeItem(LS_NUMBER);
-      localStorage.removeItem(LS_PHONE_NUMBER);
-    }
-    smsFromInput.value = currentNumber;
 
-    nodeWsUrl = seed.nodeWs;
-    if (!nodeWsUrl) throw new Error('node ws resolve failed');
+      const seed = await resolveSeed(currentNumber);
+      windowBase = seed.windowBase;
+      localStorage.setItem(LS_WINDOW_BASE, windowBase);
 
-    if (!opts?.silent) setStatus(`number: ${currentNumber}, connecting to ${nodeWsUrl} ...`);
-    await openNodeWS(currentNumber);
-    if (!opts?.silent) setStatus(`connected as ${currentNumber}, requesting challenge ...`);
+      smsFromInput.value = currentNumber;
+      nodeWsUrl = seed.nodeWs;
+      if (!nodeWsUrl) throw new Error('node ws resolve failed');
 
-    const challenge = await requestChallengeOnce();
-    const sigHex = makeAuthSignatureHex(currentNumber, challenge, privateKeyHex);
-    sendAuthVerify(sigHex);
-    await waitAuthenticated();
-    setCallPhase('idle');
-    await loadChatHistory();
-    if (!activeThreadNumber && chatItems.length > 0) {
-      const latest = chatItems[chatItems.length - 1];
-      if (latest) {
-        activeThreadNumber = threadPeer(latest).trim();
-        smsToInput.value = activeThreadNumber;
-        peerNameInput.value = contactNames[activeThreadNumber] ?? '';
+      if (!opts?.silent) setStatus(`number: ${currentNumber}, connecting to ${nodeWsUrl} ...`);
+      await openNodeWS(currentNumber, currentJWT);
+      if (!opts?.silent) setStatus(`connected as ${currentNumber}, waiting for authentication...`);
+
+      await waitAuthenticated();
+      setCallPhase('idle');
+      await loadChatHistory();
+      if (!activeThreadNumber && chatItems.length > 0) {
+        const latest = chatItems[chatItems.length - 1];
+        if (latest) {
+          activeThreadNumber = threadPeer(latest).trim();
+          smsToInput.value = activeThreadNumber;
+          peerNameInput.value = contactNames[activeThreadNumber] ?? '';
+        }
       }
-    }
-    renderChatItems();
-    renderThreadList();
-    chatPeerLabel.textContent = getDisplayName(smsToInput.value.trim());
+      renderChatItems();
+      renderThreadList();
+      chatPeerLabel.textContent = getDisplayName(smsToInput.value.trim());
 
-    if (!opts?.silent) setStatus(`ログイン成功: ${currentNumber}`);
-    setActiveScreen('chat');
+      if (!opts?.silent) setStatus(`ログイン成功: ${currentNumber}`);
+      setActiveScreen('chat');
     } finally {
       isLoggingIn = false;
     }
@@ -2321,10 +2065,10 @@ export function buildUI(): void {
       signupStep2.style.display = 'block';
       btnRegister.style.display = 'none';
       btnCreate.style.display = '';
-      btnCreate.disabled = true;
-      signupConfirmCheck.checked = false;
-      // ステップ2に入ったタイミングで新しい秘密鍵を生成する
-      generateAndShowMnemonic(signupMnemonicGrid, signupMnemonicStatus, (hex) => { signupGeneratedKeyHex = hex; }, signupConfirmCheck, btnCreate);
+      // 秘密鍵を生成しておく（バックグラウンドで）
+      generateMnemonic().then(({ privateKeyHex }) => {
+        signupGeneratedKeyHex = privateKeyHex;
+      }).catch(() => {});
       signupTokenInput.focus();
     } catch (err) {
       setErrorStatus(err);
@@ -2333,35 +2077,30 @@ export function buildUI(): void {
 
   btnCreate.onclick = async () => {
     try {
-      if (!signupGeneratedKeyHex) throw new Error('秘密鍵が生成されていません。再生成してください。');
-      if (!signupConfirmCheck.checked) throw new Error('ニーモニックを控えたことを確認してください。');
+      const password = signupPasswordInput.value;
+      const passwordConfirm = signupPasswordConfirmInput.value;
+      if (!password) throw new Error('パスワードを入力してください');
+      validateSavePassword(password);
+      if (password !== passwordConfirm) throw new Error('パスワードが一致しません');
+      if (!signupGeneratedKeyHex) {
+        // まだ生成が完了していない場合は生成する
+        const { privateKeyHex } = await generateMnemonic();
+        signupGeneratedKeyHex = privateKeyHex;
+      }
       const route = normalizeRoutingNumber(signupRouteInput.value);
       const seed = await resolveSeed(route);
       windowBase = seed.windowBase;
       localStorage.setItem(LS_WINDOW_BASE, windowBase);
       const privateKeyHex = signupGeneratedKeyHex;
       const pubHex = derivePublicKeyHex(privateKeyHex);
-      if (persistSensitiveCheck.checked) {
-        const password = savePasswordInput.value;
-        if (!password) throw new Error('端末保存にはパスワードを入力してください');
-        validateSavePassword(password);
-        const encrypted = await encryptPrivateKey(privateKeyHex, password);
-        localStorage.setItem(LS_ENCRYPTED_KEY, encrypted);
-        localStorage.setItem(LS_PUBLIC_KEY, pubHex);
-      } else {
-        localStorage.removeItem(LS_ENCRYPTED_KEY);
-        localStorage.removeItem(LS_PUBLIC_KEY);
-      }
-      const number = await createAccount(windowBase, signupTokenInput.value.trim(), pubHex);
+      const encryptedKey = await encryptPrivateKey(privateKeyHex, password);
+      const number = await createAccount(windowBase, signupTokenInput.value.trim(), pubHex, password, encryptedKey);
       setStatus(`account created: ${number}`);
-      numberInput.value = number;
-      // ログイン画面に戻った際に再入力不要なように秘密鍵を転記（type='password'でマスク済み）
-      privateKeyInput.value = privateKeyHex;
       currentNumber = number;
-      if (persistSensitiveCheck.checked) {
-        localStorage.setItem(LS_NUMBER, number);
-        localStorage.setItem(LS_PHONE_NUMBER, number);
-      }
+      localStorage.setItem(LS_EMAIL, signupEmailInput.value.trim());
+      localStorage.setItem(LS_NUMBER, number);
+      localStorage.setItem(LS_PHONE_NUMBER, number);
+      loginEmailInput.value = signupEmailInput.value.trim();
       setActiveScreen('login');
     } catch (err) {
       setErrorStatus(err);
@@ -2380,10 +2119,10 @@ export function buildUI(): void {
       resetStep2.style.display = 'block';
       btnResetReq.style.display = 'none';
       btnResetDo.style.display = '';
-      btnResetDo.disabled = true;
-      resetConfirmCheck.checked = false;
-      // ステップ2に入ったタイミングで新しい秘密鍵を生成する
-      generateAndShowMnemonic(resetMnemonicGrid, resetMnemonicStatus, (hex) => { resetGeneratedKeyHex = hex; }, resetConfirmCheck, btnResetDo);
+      // 新しい秘密鍵を生成しておく
+      generateMnemonic().then(({ privateKeyHex }) => {
+        resetGeneratedKeyHex = privateKeyHex;
+      }).catch(() => {});
       resetTokenInput.focus();
     } catch (err) {
       setErrorStatus(err);
@@ -2392,35 +2131,29 @@ export function buildUI(): void {
 
   btnResetDo.onclick = async () => {
     try {
-      if (!resetGeneratedKeyHex) throw new Error('秘密鍵が生成されていません。再生成してください。');
-      if (!resetConfirmCheck.checked) throw new Error('ニーモニックを控えたことを確認してください。');
+      const password = resetPasswordInput.value;
+      const passwordConfirm = resetPasswordConfirmInput.value;
+      if (!password) throw new Error('新しいパスワードを入力してください');
+      validateSavePassword(password);
+      if (password !== passwordConfirm) throw new Error('パスワードが一致しません');
+      if (!resetGeneratedKeyHex) {
+        const { privateKeyHex } = await generateMnemonic();
+        resetGeneratedKeyHex = privateKeyHex;
+      }
       const route = normalizeRoutingNumber(resetRouteInput.value);
       const seed = await resolveSeed(route);
       windowBase = seed.windowBase;
       localStorage.setItem(LS_WINDOW_BASE, windowBase);
       const privateKeyHex = resetGeneratedKeyHex;
       const pubHex = derivePublicKeyHex(privateKeyHex);
-      if (persistSensitiveCheck.checked) {
-        const password = savePasswordInput.value;
-        if (!password) throw new Error('端末保存にはパスワードを入力してください');
-        validateSavePassword(password);
-        const encrypted = await encryptPrivateKey(privateKeyHex, password);
-        localStorage.setItem(LS_ENCRYPTED_KEY, encrypted);
-        localStorage.setItem(LS_PUBLIC_KEY, pubHex);
-      } else {
-        localStorage.removeItem(LS_ENCRYPTED_KEY);
-        localStorage.removeItem(LS_PUBLIC_KEY);
-      }
-      const number = await resetDo(windowBase, resetTokenInput.value.trim(), pubHex);
+      const encryptedKey = await encryptPrivateKey(privateKeyHex, password);
+      const number = await resetDo(windowBase, resetTokenInput.value.trim(), pubHex, password, encryptedKey);
       setStatus(`reset done: ${number}`);
-      numberInput.value = number;
-      // ログイン画面に戻った際に再入力不要なように秘密鍵を転記（type='password'でマスク済み）
-      privateKeyInput.value = privateKeyHex;
       currentNumber = number;
-      if (persistSensitiveCheck.checked) {
-        localStorage.setItem(LS_NUMBER, number);
-        localStorage.setItem(LS_PHONE_NUMBER, number);
-      }
+      localStorage.setItem(LS_EMAIL, resetEmailInput.value.trim());
+      localStorage.setItem(LS_NUMBER, number);
+      localStorage.setItem(LS_PHONE_NUMBER, number);
+      loginEmailInput.value = resetEmailInput.value.trim();
       setActiveScreen('login');
     } catch (err) {
       setErrorStatus(err);
@@ -2442,7 +2175,7 @@ export function buildUI(): void {
       if (!from) throw new Error('from is required');
       if (!body) throw new Error('message is required');
       // セッション変数を使用する（未ログイン状態ではここに到達しないが念のためチェック）
-      const rawPrivKey = currentPrivateKeyHex || privateKeyInput.value.trim();
+      const rawPrivKey = currentPrivateKeyHex;
       if (!rawPrivKey) throw new Error('セッションが切れました。再ログインしてください。');
       const privateKeyHex = normalizePrivateKeyHex(rawPrivKey);
       const sig = makeMessageSignatureHex(from, to, { body }, timestamp, privateKeyHex);
@@ -2548,28 +2281,16 @@ export function buildUI(): void {
     }
   };
 
-  // 起動時: 旧形式（プレーンテキスト）の秘密鍵が残っていれば移行を促す
-  const legacyPlainKey = localStorage.getItem(LS_PRIVATE_KEY);
-  if (legacyPlainKey && !localStorage.getItem(LS_ENCRYPTED_KEY)) {
-    // 旧鍵を秘密鍵入力欄に転記してユーザーにパスワードを設定させる
-    privateKeyInput.value = legacyPlainKey;
-    // 旧鍵を削除（平文で保存しない）
-    localStorage.removeItem(LS_PRIVATE_KEY);
-    privateKeySection.style.display = 'block';
-    privateKeyToggle.textContent = '▼ 秘密鍵で直接ログインする';
-    setStatus('セキュリティのため保存形式が変更されました。「端末に保存」にチェックを入れてパスワードを設定し、再度ログインしてください（チェックなしでもログインできます）。');
-  } else if (localStorage.getItem(LS_PRIVATE_KEY)) {
+  // 起動時: 旧形式（プレーンテキスト）の秘密鍵が残っていれば削除する
+  if (localStorage.getItem(LS_PRIVATE_KEY)) {
     localStorage.removeItem(LS_PRIVATE_KEY);
   }
 
-  const savedNumber = (localStorage.getItem(LS_PHONE_NUMBER) ?? localStorage.getItem(LS_NUMBER) ?? '').trim();
-  const savedEncryptedKey = (localStorage.getItem(LS_ENCRYPTED_KEY) ?? '').trim();
-  const persistSensitiveEnabled = (localStorage.getItem(LS_PERSIST_SENSITIVE) ?? '1') !== '0';
-  persistSensitiveCheck.checked = persistSensitiveEnabled;
-  if (persistSensitiveEnabled && savedNumber && savedEncryptedKey) {
-    numberInput.value = savedNumber;
-    // パスワード入力欄を表示してログインを促す（自動ログインは行わない）
-    savePasswordGroup.style.display = 'block';
-    setStatus('保存済みのデータがあります。パスワードを入力してログインしてください。');
+  // 保存済みメールアドレスがあれば入力欄に反映する
+  const savedEmail = (localStorage.getItem(LS_EMAIL) ?? '').trim();
+  if (savedEmail) {
+    loginEmailInput.value = savedEmail;
+    setStatus('メールアドレスとパスワードを入力してログインしてください。');
   }
+}
 }
