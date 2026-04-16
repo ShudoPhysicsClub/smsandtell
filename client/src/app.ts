@@ -547,7 +547,7 @@ async function encryptPrivateKey(privateKeyHex: string, password: string): Promi
     false,
     ['encrypt'],
   );
-  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: ivArr.buffer }, aesKey, enc.encode(privateKeyHex));
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: ivArr.buffer, tagLength: 128 }, aesKey, enc.encode(privateKeyHex));
   return `v1:${_bytesToHexLocal(saltArr)}:${_bytesToHexLocal(ivArr)}:${_bytesToHexLocal(new Uint8Array(ciphertext))}`;
 }
 
@@ -569,11 +569,18 @@ async function decryptPrivateKey(encrypted: string, password: string): Promise<s
   );
   let plaintext: ArrayBuffer;
   try {
-    plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivArr.buffer }, aesKey, ciphertextArr.buffer);
-  } catch {
+    plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivArr.buffer, tagLength: 128 }, aesKey, ciphertextArr.buffer);
+  } catch (err) {
+    console.debug('decryptPrivateKey failed:', err);
     throw new Error('パスワードが違います');
   }
   return new TextDecoder().decode(plaintext);
+}
+
+function validateSavePassword(password: string): void {
+  if (password.length < 8) {
+    throw new Error('保存パスワードは8文字以上で入力してください');
+  }
 }
 
 function createChallengeHex(): string {
@@ -2233,6 +2240,7 @@ export function buildUI(): void {
     if (persistSensitiveCheck.checked) {
       const password = savePasswordInput.value;
       if (!password) throw new Error('端末保存にはパスワードを入力してください');
+      validateSavePassword(password);
       const encrypted = await encryptPrivateKey(privateKeyHex, password);
       localStorage.setItem(LS_ENCRYPTED_KEY, encrypted);
     } else {
@@ -2336,6 +2344,7 @@ export function buildUI(): void {
       if (persistSensitiveCheck.checked) {
         const password = savePasswordInput.value;
         if (!password) throw new Error('端末保存にはパスワードを入力してください');
+        validateSavePassword(password);
         const encrypted = await encryptPrivateKey(privateKeyHex, password);
         localStorage.setItem(LS_ENCRYPTED_KEY, encrypted);
         localStorage.setItem(LS_PUBLIC_KEY, pubHex);
@@ -2394,6 +2403,7 @@ export function buildUI(): void {
       if (persistSensitiveCheck.checked) {
         const password = savePasswordInput.value;
         if (!password) throw new Error('端末保存にはパスワードを入力してください');
+        validateSavePassword(password);
         const encrypted = await encryptPrivateKey(privateKeyHex, password);
         localStorage.setItem(LS_ENCRYPTED_KEY, encrypted);
         localStorage.setItem(LS_PUBLIC_KEY, pubHex);
@@ -2538,8 +2548,17 @@ export function buildUI(): void {
     }
   };
 
-  // 起動時: 旧形式（プレーンテキスト）の秘密鍵が残っていれば削除して移行する
-  if (localStorage.getItem(LS_PRIVATE_KEY)) {
+  // 起動時: 旧形式（プレーンテキスト）の秘密鍵が残っていれば移行を促す
+  const legacyPlainKey = localStorage.getItem(LS_PRIVATE_KEY);
+  if (legacyPlainKey && !localStorage.getItem(LS_ENCRYPTED_KEY)) {
+    // 旧鍵を秘密鍵入力欄に転記してユーザーにパスワードを設定させる
+    privateKeyInput.value = legacyPlainKey;
+    // 旧鍵を削除（平文で保存しない）
+    localStorage.removeItem(LS_PRIVATE_KEY);
+    privateKeySection.style.display = 'block';
+    privateKeyToggle.textContent = '▼ 秘密鍵で直接ログインする';
+    setStatus('セキュリティのため、端末保存の形式が変更されました。パスワードを設定して再度ログインしてください。');
+  } else if (localStorage.getItem(LS_PRIVATE_KEY)) {
     localStorage.removeItem(LS_PRIVATE_KEY);
   }
 
