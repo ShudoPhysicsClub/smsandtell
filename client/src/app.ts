@@ -5,15 +5,11 @@ import {
   styleInputBase,
   toErrorText,
 } from './dom';
-import { generateMnemonic } from './mnemonic';
 import {
   createAccount,
-  getPublicKeyByNumber,
   loginAccount,
   resolveSeed,
-  sendCallAuthChallenge,
   sendCallAuthOK,
-  sendCallAuthResponse,
   sendCallHangup,
   sendCallReject,
   resetDo,
@@ -24,16 +20,12 @@ import {
   sendSMS,
 } from './api';
 import type { NodeInbound, ScreenKey } from './types';
-import { PointPairSchnorrP256 } from './ecdsa';
 
 let windowBase = 'https://WINDOW_SERVER_HOST:30000';
 let nodeWsUrl = '';
 let nodeSocket: WebSocket | null = null;
 let currentNumber = '';
 let isAuthenticated = false;
-// currentPrivateKeyHex はセッション中のみメモリに保持する秘密鍵（永続化しない）。
-// persist=off の場合でも通話認証・SMS署名に使用できるようにする。
-let currentPrivateKeyHex = '';
 // currentJWT はセッション中のみメモリに保持するJWTトークン（永続化しない）。
 let currentJWT = '';
 let pendingAuthResolver: (() => void) | null = null;
@@ -55,15 +47,8 @@ let remoteAudioNode: HTMLAudioElement | null = null;
 let activeCallPeer = '';
 // remoteDescriptionが設定される前に届いたICE candidateをバッファする
 let pendingIceCandidates: RTCIceCandidateInit[] = [];
-let pendingCallAuth:
-  | {
-      peer: string;
-      challenge: string;
-      publicKeyHex: string;
-    }
-  | null = null;
 
-type CallPhase = 'idle' | 'dialing' | 'ringing' | 'verifying' | 'in_call' | 'ended';
+type CallPhase = 'idle' | 'dialing' | 'ringing' | 'in_call' | 'ended';
 let callPhase: CallPhase = 'idle';
 let syncCallUIRef: ((phase: CallPhase, note?: string) => void) | null = null;
 let syncCallRuntimeRef: (() => void) | null = null;
@@ -81,8 +66,7 @@ let lastToastCount = 0;
 
 const LS_WINDOW_BASE = 'smsandtell.windowBase';
 const LS_NUMBER = 'smsandtell.number';
-const LS_EMAIL = 'smsandtell.email';
-const LS_PRIVATE_KEY = 'smsandtell.privateKey'; // legacy: plain-text key (migration only)
+const LS_USERNAME = 'smsandtell.username';
 const CHAT_DB_NAME = 'smsandtell-chat';
 const CHAT_DB_VERSION = 1;
 const CHAT_DB_STORE = 'threads';
@@ -153,17 +137,12 @@ async function saveThread(owner: string, items: ChatItem[], contacts: Record<str
   });
 }
 
-const signer = new PointPairSchnorrP256();
-
 function setStatus(text: string): void {
   if (statusNode) statusNode.textContent = text;
 }
 
 function mapErrorToCode(message: string): { code: string; user: string; technical: string } {
   const m = message.toLowerCase();
-  if (m.includes('private key') || m.includes('秘密鍵')) {
-    return { code: 'AUTH_001', user: '秘密鍵の形式が正しくない', technical: message };
-  }
   if (m.includes('auth timeout') || m.includes('challenge timeout')) {
     return { code: 'AUTH_002', user: '認証がタイムアウトした', technical: message };
   }
@@ -172,9 +151,6 @@ function mapErrorToCode(message: string): { code: string; user: string; technica
   }
   if (m.includes('ws not connected') || m.includes('connect failed')) {
     return { code: 'NET_002', user: 'ノード接続に失敗した', technical: message };
-  }
-  if (m.includes('signature') || m.includes('認証失敗')) {
-    return { code: 'CALL_001', user: '通話相手の認証に失敗した', technical: message };
   }
   if (m.includes('required') || m.includes('必須')) {
     return { code: 'UI_001', user: '入力必須項目を確認して', technical: message };
@@ -266,10 +242,8 @@ function closeNodeWS(): void {
     nodeSocket = null;
   }
   isAuthenticated = false;
-  currentPrivateKeyHex = '';
   currentJWT = '';
   pendingAuthResolver = null;
-  pendingCallAuth = null;
   cleanupCall();
   setCallPhase('idle');
   refreshAuthState();
@@ -310,7 +284,6 @@ function openNodeWS(number: string, jwt: string): Promise<void> {
         isAuthenticated = false;
         currentJWT = '';
         pendingAuthResolver = null;
-        pendingCallAuth = null;
         cleanupCall();
         setCallPhase('idle');
         refreshAuthState();
@@ -350,8 +323,6 @@ function openNodeWS(number: string, jwt: string): Promise<void> {
       }
 
       if (
-        data.action === 'call_auth_challenge' ||
-        data.action === 'call_auth_response' ||
         data.action === 'call_reject' ||
         data.action === 'call_auth_ok' ||
         data.action === 'call_hangup'
@@ -400,164 +371,6 @@ function waitAuthenticated(timeoutMs = 6000): Promise<void> {
       resolve();
     };
   });
-}
-
-function canonicalJSONStringify(value: unknown): string {
-  const seen = new WeakSet<object>();
-  const walk = (v: unknown): unknown => {
-    if (v === null || typeof v !== 'object') return v;
-    if (Array.isArray(v)) return v.map(walk);
-    const obj = v as Record<string, unknown>;
-    if (seen.has(obj)) throw new Error('circular object');
-    seen.add(obj);
-    const out: Record<string, unknown> = {};
-    const keys = Object.keys(obj).sort();
-    for (const k of keys) {
-      out[k] = walk(obj[k]);
-    }
-    return out;
-  };
-  return JSON.stringify(walk(value));
-}
-
-function makeAuthSignatureHex(number: string, challenge: string, privateKeyHex: string): string {
-  const priv = signer.hexToBytes(privateKeyHex);
-  if (priv.length !== 32) {
-    throw new Error('private key must be 32 bytes hex');
-  }
-  const payload = canonicalJSONStringify({ number, challenge });
-  const msg = new TextEncoder().encode(payload);
-  const pub = signer.privatekeytoPublicKey(priv);
-  const sig = signer.sign(msg, priv, pub);
-  return signer.bytesToHex(sig[0]) + signer.bytesToHex(sig[1]) + signer.bytesToHex(sig[2]);
-}
-
-function makeMessageSignatureHex(
-  from: string,
-  to: string,
-  message: unknown,
-  timestamp: number,
-  privateKeyHex: string,
-): string {
-  const priv = signer.hexToBytes(privateKeyHex);
-  if (priv.length !== 32) {
-    throw new Error('private key must be 32 bytes hex');
-  }
-  const payload = canonicalJSONStringify({ timestamp, message, to, from });
-  const msg = new TextEncoder().encode(payload);
-  const pub = signer.privatekeytoPublicKey(priv);
-  const sig = signer.sign(msg, priv, pub);
-  return signer.bytesToHex(sig[0]) + signer.bytesToHex(sig[1]) + signer.bytesToHex(sig[2]);
-}
-
-function derivePublicKeyHex(privateKeyHex: string): string {
-  const priv = signer.hexToBytes(privateKeyHex);
-  if (priv.length !== 32) {
-    throw new Error('private key must be 32 bytes hex');
-  }
-  const pub = signer.privatekeytoPublicKey(priv);
-  return signer.bytesToHex(pub[0]) + signer.bytesToHex(pub[1]);
-}
-
-function normalizePrivateKeyHex(privateKeyHex: string): string {
-  const hex = privateKeyHex.trim().toUpperCase();
-  if (!/^[0-9A-F]{64}$/.test(hex)) {
-    throw new Error('private key は64桁の16進文字で入力');
-  }
-  return hex;
-}
-
-function _bytesToHexLocal(bytes: Uint8Array): string {
-  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-function _hexToBytesLocal(hex: string): Uint8Array {
-  const pairs = hex.match(/.{2}/g) ?? [];
-  return new Uint8Array(pairs.map(b => parseInt(b, 16)));
-}
-
-async function encryptPrivateKey(privateKeyHex: string, password: string): Promise<string> {
-  const enc = new TextEncoder();
-  const saltArr = new Uint8Array(16);
-  crypto.getRandomValues(saltArr);
-  const ivArr = new Uint8Array(12);
-  crypto.getRandomValues(ivArr);
-  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']);
-  const aesKey = await crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt: saltArr.buffer as ArrayBuffer, iterations: 100000, hash: 'SHA-256' },
-    keyMaterial,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt'],
-  );
-  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: ivArr.buffer as ArrayBuffer, tagLength: 128 }, aesKey, enc.encode(privateKeyHex));
-  return `v1:${_bytesToHexLocal(saltArr)}:${_bytesToHexLocal(ivArr)}:${_bytesToHexLocal(new Uint8Array(ciphertext))}`;
-}
-
-async function decryptPrivateKey(encrypted: string, password: string): Promise<string> {
-  const parts = encrypted.split(':');
-  if (parts.length !== 4 || parts[0] !== 'v1') throw new Error('保存済みの鍵の形式が不正です');
-  const [, saltHex, ivHex, cipherHex] = parts as [string, string, string, string];
-  const saltArr = _hexToBytesLocal(saltHex);
-  const ivArr = _hexToBytesLocal(ivHex);
-  const ciphertextArr = _hexToBytesLocal(cipherHex);
-  const enc = new TextEncoder();
-  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']);
-  const aesKey = await crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt: saltArr.buffer as ArrayBuffer, iterations: 100000, hash: 'SHA-256' },
-    keyMaterial,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['decrypt'],
-  );
-  let plaintext: ArrayBuffer;
-  try {
-    plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivArr.buffer as ArrayBuffer, tagLength: 128 }, aesKey, ciphertextArr.buffer as ArrayBuffer);
-  } catch (err) {
-    console.debug('decryptPrivateKey failed:', err);
-    throw new Error('パスワードが違います');
-  }
-  return new TextDecoder().decode(plaintext);
-}
-
-function validateSavePassword(password: string): void {
-  if (password.length < 8) {
-    throw new Error('保存パスワードは8文字以上で入力してください');
-  }
-}
-
-function createChallengeHex(): string {
-  const b = new Uint8Array(32);
-  crypto.getRandomValues(b);
-  return Array.from(b)
-    .map((x) => x.toString(16).padStart(2, '0'))
-    .join('');
-}
-
-function splitPublicKeyHex(pubHex: string): [Uint8Array, Uint8Array] {
-  const norm = pubHex.trim().toUpperCase();
-  if (!/^[0-9A-F]{128}$/.test(norm)) {
-    throw new Error('invalid public key encoding');
-  }
-  const bytes = signer.hexToBytes(norm);
-  return [bytes.slice(0, 32), bytes.slice(32, 64)];
-}
-
-function splitSignatureHex(sigHex: string): [Uint8Array, Uint8Array, Uint8Array] {
-  const norm = sigHex.trim().toUpperCase();
-  if (!/^[0-9A-F]{192}$/.test(norm)) {
-    throw new Error('invalid signature encoding');
-  }
-  const bytes = signer.hexToBytes(norm);
-  return [bytes.slice(0, 32), bytes.slice(32, 64), bytes.slice(64, 96)];
-}
-
-function verifyCallAuthSignature(number: string, challenge: string, sigHex: string, publicKeyHex: string): boolean {
-  const payload = canonicalJSONStringify({ number, challenge });
-  const msg = new TextEncoder().encode(payload);
-  const pub = splitPublicKeyHex(publicKeyHex);
-  const sig = splitSignatureHex(sigHex);
-  return signer.verify(msg, pub, sig);
 }
 
 function ringUser(): void {
@@ -709,12 +522,10 @@ async function handleSignalAction(action: string, payload: unknown): Promise<voi
     for (const c of queued) {
       await callPeer.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
     }
-    const publicKeyHex = await getPublicKeyByNumber(windowBase, from);
-    const challenge = createChallengeHex();
-    pendingCallAuth = { peer: from, challenge, publicKeyHex };
-    setCallPhase('verifying', `${from} の認証を検証中`);
-    await sendCallAuthChallenge(windowBase, { from: currentNumber, to: from, challenge });
-    setStatus('call auth challenge sent');
+    // 認証不要: ICEアンサー受信後にすぐ call_auth_ok を送信して通話開始
+    await sendCallAuthOK(windowBase, { from: currentNumber, to: from });
+    setCallPhase('in_call', `${from} と通話中`);
+    setStatus('call connected');
     return;
   }
 
@@ -730,53 +541,15 @@ async function handleSignalAction(action: string, payload: unknown): Promise<voi
     return;
   }
 
-  if (action === 'call_auth_challenge') {
-    const challenge = String(body.challenge ?? '').trim();
-    if (!from || !challenge) return;
-    // セッション中の秘密鍵を使用する
-    const privateKeyHex = currentPrivateKeyHex;
-    if (!privateKeyHex) return;
-    const sig = makeAuthSignatureHex(currentNumber, challenge, privateKeyHex);
-    setCallPhase('verifying', `${from} に認証応答を送信`);
-    await sendCallAuthResponse(windowBase, { from: currentNumber, to: from, challenge, sig });
-    return;
-  }
-
-  if (action === 'call_auth_response') {
-    const challenge = String(body.challenge ?? '').trim();
-    const sig = String(body.sig ?? '').trim();
-    if (!from || !challenge || !sig) return;
-    if (!pendingCallAuth || pendingCallAuth.peer !== from || pendingCallAuth.challenge !== challenge) {
-      await sendCallReject(windowBase, { from: currentNumber, to: from, reason: 'auth-state-mismatch' });
-      cleanupCall();
-      setCallPhase('ended', '認証状態不一致で通話終了');
-      return;
-    }
-    const ok = verifyCallAuthSignature(from, challenge, sig, pendingCallAuth.publicKeyHex);
-    pendingCallAuth = null;
-    if (!ok) {
-      await sendCallReject(windowBase, { from: currentNumber, to: from, reason: 'invalid-signature' });
-      cleanupCall();
-      setCallPhase('ended', '認証失敗で自動拒否');
-      setStatus('call rejected automatically (auth failed)');
-      return;
-    }
-    await sendCallAuthOK(windowBase, { from: currentNumber, to: from });
-    setCallPhase('in_call', `${from} と通話中`);
-    setStatus('call peer authentication passed');
-    return;
-  }
-
   if (action === 'call_auth_ok') {
     ringUser();
     setCallPhase('in_call', `${from} と通話中`);
-    setStatus('authenticated incoming call');
+    setStatus('call connected');
     return;
   }
 
   if (action === 'call_reject') {
     cleanupCall();
-    pendingCallAuth = null;
     setCallPhase('ended', `${from || '相手'} が拒否`);
     setStatus(`call rejected: ${String(body.reason ?? 'rejected')}`);
     return;
@@ -784,7 +557,6 @@ async function handleSignalAction(action: string, payload: unknown): Promise<voi
 
   if (action === 'call_hangup') {
     cleanupCall();
-    pendingCallAuth = null;
     setCallPhase('ended', `${from || '相手'} が終話`);
     setStatus('call hangup received');
   }
@@ -1008,16 +780,16 @@ export function buildUI(): void {
   loginScreen.style.cssText = 'width:100%;background:linear-gradient(135deg,#13111c 0%,#1d1b31 50%,#111827 100%);display:flex;justify-content:center;align-items:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
   const loginCard = makeCard('ログイン');
 
-  const loginEmailInput = createInput('loginEmail', 'メールアドレス');
-  loginEmailInput.type = 'email';
-  loginEmailInput.autocomplete = 'email';
-  loginEmailInput.value = localStorage.getItem(LS_EMAIL) ?? '';
+  const loginUsernameInput = createInput('loginUsername', 'ユーザー名');
+  loginUsernameInput.type = 'text';
+  loginUsernameInput.autocomplete = 'username';
+  loginUsernameInput.value = localStorage.getItem(LS_USERNAME) ?? '';
 
   const loginPasswordInput = createInput('loginPassword', 'パスワード');
   loginPasswordInput.type = 'password';
   loginPasswordInput.autocomplete = 'current-password';
 
-  loginCard.appendChild(makeFormGroup('メールアドレス', loginEmailInput));
+  loginCard.appendChild(makeFormGroup('ユーザー名', loginUsernameInput));
   loginCard.appendChild(makeFormGroup('パスワード', loginPasswordInput));
 
   const btnLookupConnect = makePrimaryBtn('btnLookupConnect', 'ログイン');
@@ -1032,7 +804,10 @@ export function buildUI(): void {
   signupScreen.style.cssText = 'width:100%;background:linear-gradient(135deg,#13111c 0%,#1d1b31 50%,#111827 100%);display:flex;justify-content:center;align-items:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
   const signupCard = makeCard('新規登録');
 
-  const signupEmailInput = createInput('signupEmail', 'メールアドレス');
+  const signupUsernameInput = createInput('signupUsername', 'ユーザー名');
+  signupUsernameInput.type = 'text';
+  signupUsernameInput.autocomplete = 'username';
+  const signupEmailInput = createInput('signupEmail', 'メールアドレス（パスワードリセット用）');
   signupEmailInput.type = 'email';
   signupEmailInput.autocomplete = 'email';
   const signupPasswordInput = createInput('signupPassword', 'パスワード（8文字以上）');
@@ -1042,6 +817,7 @@ export function buildUI(): void {
   signupPasswordConfirmInput.type = 'password';
   signupPasswordConfirmInput.autocomplete = 'new-password';
 
+  signupCard.appendChild(makeFormGroup('ユーザー名', signupUsernameInput));
   signupCard.appendChild(makeFormGroup('メールアドレス', signupEmailInput));
   signupCard.appendChild(makeFormGroup('パスワード', signupPasswordInput));
   signupCard.appendChild(makeFormGroup('パスワード（確認）', signupPasswordConfirmInput));
@@ -1071,9 +847,6 @@ export function buildUI(): void {
   const resetPasswordConfirmInput = createInput('resetPasswordConfirm', '新しいパスワード（確認）');
   resetPasswordConfirmInput.type = 'password';
   resetPasswordConfirmInput.autocomplete = 'new-password';
-
-  // 生成した新しい秘密鍵を一時保存
-  let resetGeneratedKeyHex = '';
 
   const resetStep1 = document.createElement('div');
   const resetStep2 = document.createElement('div');
@@ -1497,7 +1270,6 @@ export function buildUI(): void {
     idle: '待機中',
     dialing: '発信中',
     ringing: '着信処理中',
-    verifying: '認証中',
     in_call: '通話中',
     ended: '終了',
   };
@@ -1845,7 +1617,6 @@ export function buildUI(): void {
   disconnectXButton.style.backdropFilter = 'blur(8px)';
   disconnectXButton.onclick = () => {
     closeNodeWS();
-    pendingCallAuth = null;
     setStatus('disconnected');
   };
   container.appendChild(disconnectXButton);
@@ -1860,29 +1631,21 @@ export function buildUI(): void {
     if (isLoggingIn) throw new Error('ログイン処理中です。完了をお待ちください');
     isLoggingIn = true;
     try {
-      const email = loginEmailInput.value.trim();
+      const username = loginUsernameInput.value.trim();
       const password = loginPasswordInput.value;
-      if (!email) throw new Error('メールアドレスを入力してください');
+      if (!username) throw new Error('ユーザー名を入力してください');
       if (!password) throw new Error('パスワードを入力してください');
 
-      // window サーバーを解決する（ルーティング番号からDNSを引く）
-      // メールの @ 前部分からルーティングを推定することは難しいため、
-      // まずデフォルトの windowBase を使ってログインを試みる。
       const savedWindowBase = localStorage.getItem(LS_WINDOW_BASE) ?? windowBase;
       windowBase = savedWindowBase;
 
       if (!opts?.silent) setStatus('ログイン中...');
-      const loginResult = await loginAccount(windowBase, email, password);
+      const loginResult = await loginAccount(windowBase, username, password);
 
       currentNumber = loginResult.number;
       currentJWT = loginResult.token;
-      const encryptedKey = loginResult.encrypted_key;
 
-      if (!encryptedKey) throw new Error('サーバーから鍵データが返されませんでした。再登録してください。');
-      const privateKeyHex = normalizePrivateKeyHex(await decryptPrivateKey(encryptedKey, password));
-      currentPrivateKeyHex = privateKeyHex;
-
-      localStorage.setItem(LS_EMAIL, email);
+      localStorage.setItem(LS_USERNAME, username);
       localStorage.setItem(LS_NUMBER, currentNumber);
 
       const seed = await resolveSeed(currentNumber);
@@ -1932,22 +1695,21 @@ export function buildUI(): void {
 
   btnCreate.onclick = async () => {
     try {
+      const username = signupUsernameInput.value.trim();
       const email = signupEmailInput.value.trim();
-      if (!email) throw new Error('メールアドレスを入力してください');
       const password = signupPasswordInput.value;
       const passwordConfirm = signupPasswordConfirmInput.value;
+      if (!username) throw new Error('ユーザー名を入力してください');
+      if (!email) throw new Error('メールアドレスを入力してください');
       if (!password) throw new Error('パスワードを入力してください');
-      validateSavePassword(password);
+      if (password.length < 8) throw new Error('パスワードは8文字以上で入力してください');
       if (password !== passwordConfirm) throw new Error('パスワードが一致しません');
-      const { privateKeyHex } = await generateMnemonic();
-      const pubHex = derivePublicKeyHex(privateKeyHex);
-      const encryptedKey = await encryptPrivateKey(privateKeyHex, password);
-      const number = await createAccount(windowBase, email, pubHex, password, encryptedKey);
+      const number = await createAccount(windowBase, email, username, password);
       setStatus(`account created: ${number}`);
       currentNumber = number;
-      localStorage.setItem(LS_EMAIL, email);
+      localStorage.setItem(LS_USERNAME, username);
       localStorage.setItem(LS_NUMBER, number);
-      loginEmailInput.value = email;
+      loginUsernameInput.value = username;
       setActiveScreen('login');
     } catch (err) {
       setErrorStatus(err);
@@ -1962,10 +1724,6 @@ export function buildUI(): void {
       resetStep2.style.display = 'block';
       btnResetReq.style.display = 'none';
       btnResetDo.style.display = '';
-      // 新しい秘密鍵を生成しておく
-      generateMnemonic().then(({ privateKeyHex }) => {
-        resetGeneratedKeyHex = privateKeyHex;
-      }).catch(() => {});
       resetTokenInput.focus();
     } catch (err) {
       setErrorStatus(err);
@@ -1977,21 +1735,12 @@ export function buildUI(): void {
       const password = resetPasswordInput.value;
       const passwordConfirm = resetPasswordConfirmInput.value;
       if (!password) throw new Error('新しいパスワードを入力してください');
-      validateSavePassword(password);
+      if (password.length < 8) throw new Error('パスワードは8文字以上で入力してください');
       if (password !== passwordConfirm) throw new Error('パスワードが一致しません');
-      if (!resetGeneratedKeyHex) {
-        const { privateKeyHex } = await generateMnemonic();
-        resetGeneratedKeyHex = privateKeyHex;
-      }
-      const privateKeyHex = resetGeneratedKeyHex;
-      const pubHex = derivePublicKeyHex(privateKeyHex);
-      const encryptedKey = await encryptPrivateKey(privateKeyHex, password);
-      const number = await resetDo(windowBase, resetTokenInput.value.trim(), pubHex, password, encryptedKey);
+      const number = await resetDo(windowBase, resetTokenInput.value.trim(), password);
       setStatus(`reset done: ${number}`);
       currentNumber = number;
-      localStorage.setItem(LS_EMAIL, resetEmailInput.value.trim());
       localStorage.setItem(LS_NUMBER, number);
-      loginEmailInput.value = resetEmailInput.value.trim();
       setActiveScreen('login');
     } catch (err) {
       setErrorStatus(err);
@@ -2012,11 +1761,6 @@ export function buildUI(): void {
       if (!to) throw new Error('to is required');
       if (!from) throw new Error('from is required');
       if (!body) throw new Error('message is required');
-      // セッション変数を使用する（未ログイン状態ではここに到達しないが念のためチェック）
-      const rawPrivKey = currentPrivateKeyHex;
-      if (!rawPrivKey) throw new Error('セッションが切れました。再ログインしてください。');
-      const privateKeyHex = normalizePrivateKeyHex(rawPrivKey);
-      const sig = makeMessageSignatureHex(from, to, { body }, timestamp, privateKeyHex);
 
       pendingId = crypto.randomUUID();
       chatItems.push({
@@ -2033,7 +1777,7 @@ export function buildUI(): void {
       renderThreadList();
       persistThread();
 
-      await sendSMS(windowBase, to, from, body, sig, timestamp);
+      await sendSMS(windowBase, to, from, body, timestamp);
       const target = chatItems.find((x) => x.id === pendingId);
       if (target) target.status = 'sent';
       renderChatItems();
@@ -2091,7 +1835,6 @@ export function buildUI(): void {
     const peer = activeCallPeer;
     const from = currentNumber;
     cleanupCall();
-    pendingCallAuth = null;
     setCallPhase('ended', 'こちらから終話');
     if (peer && from) {
       try {
@@ -2119,15 +1862,10 @@ export function buildUI(): void {
     }
   };
 
-  // 起動時: 旧形式（プレーンテキスト）の秘密鍵が残っていれば削除する
-  if (localStorage.getItem(LS_PRIVATE_KEY)) {
-    localStorage.removeItem(LS_PRIVATE_KEY);
-  }
-
-  // 保存済みメールアドレスがあれば入力欄に反映する
-  const savedEmail = (localStorage.getItem(LS_EMAIL) ?? '').trim();
-  if (savedEmail) {
-    loginEmailInput.value = savedEmail;
-    setStatus('メールアドレスとパスワードを入力してログインしてください。');
+  // 保存済みユーザー名があれば入力欄に反映する
+  const savedUsername = (localStorage.getItem(LS_USERNAME) ?? '').trim();
+  if (savedUsername) {
+    loginUsernameInput.value = savedUsername;
+    setStatus('パスワードを入力してログインしてください。');
   }
 }

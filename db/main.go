@@ -63,27 +63,28 @@ func initDB() error {
 	CREATE TABLE IF NOT EXISTS users (
 		email VARCHAR(255) PRIMARY KEY,
 		number VARCHAR(128) UNIQUE NOT NULL,
-		public_key CHAR(128) NOT NULL,
+		username VARCHAR(128) UNIQUE NOT NULL DEFAULT '',
 		password_hash VARCHAR(255) NOT NULL DEFAULT '',
-		encrypted_key TEXT NOT NULL DEFAULT '',
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		INDEX idx_number (number),
-		INDEX idx_pubkey (public_key)
+		INDEX idx_username (username)
 	)
 	`)
 	if err != nil {
 		return err
 	}
 	// 既存テーブルへのカラム追加（移行対応）
-	for _, col := range []string{
-		"ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255) NOT NULL DEFAULT ''",
-		"ALTER TABLE users ADD COLUMN IF NOT EXISTS encrypted_key TEXT NOT NULL DEFAULT ''",
+	for _, col := range []struct{ stmt, desc string }{
+		{"ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255) NOT NULL DEFAULT ''", "password_hash"},
+		{"ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(128) NOT NULL DEFAULT ''", "username"},
 	} {
-		if _, err := db.Exec(col); err != nil {
+		if _, err := db.Exec(col.stmt); err != nil {
 			// 既にカラムが存在する場合は無視する（MySQL 8.0 以前は IF NOT EXISTS 非対応）
 			_ = err
 		}
 	}
+	// username の UNIQUE インデックスを追加（移行対応）
+	_, _ = db.Exec("ALTER TABLE users ADD UNIQUE INDEX idx_username (username)")
 	if err != nil {
 		return err
 	}
@@ -154,38 +155,13 @@ func handleGetUserByNumber(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing number", http.StatusBadRequest)
 		return
 	}
-	var email, pubkey string
-	if err := db.QueryRow("SELECT email, public_key FROM users WHERE number = ?", req.Number).Scan(&email, &pubkey); err != nil {
+	var email, username string
+	if err := db.QueryRow("SELECT email, username FROM users WHERE number = ?", req.Number).Scan(&email, &username); err != nil {
 		http.Error(w, "user not found", http.StatusNotFound)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"email": email, "public_key": pubkey})
-}
-
-func handleGetUserByPubkey(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var req struct {
-		PublicKey string `json:"public_key"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
-	if req.PublicKey == "" {
-		http.Error(w, "missing public_key", http.StatusBadRequest)
-		return
-	}
-	var number string
-	if err := db.QueryRow("SELECT number FROM users WHERE public_key = ?", req.PublicKey).Scan(&number); err != nil {
-		http.Error(w, "user not found", http.StatusNotFound)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"number": number})
+	json.NewEncoder(w).Encode(map[string]string{"email": email, "username": username})
 }
 
 func handleCreateUser(w http.ResponseWriter, r *http.Request) {
@@ -194,15 +170,15 @@ func handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Email     string `json:"email"`
-		PublicKey string `json:"public_key"`
+		Email    string `json:"email"`
+		Username string `json:"username"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	if req.Email == "" || req.PublicKey == "" {
-		http.Error(w, "missing email or public_key", http.StatusBadRequest)
+	if req.Email == "" || req.Username == "" {
+		http.Error(w, "missing email or username", http.StatusBadRequest)
 		return
 	}
 	number, err := generateUserNumber("")
@@ -210,7 +186,7 @@ func handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to generate number", http.StatusInternalServerError)
 		return
 	}
-	if _, err := db.Exec("INSERT INTO users (email, number, public_key) VALUES (?, ?, ?)", req.Email, number, req.PublicKey); err != nil {
+	if _, err := db.Exec("INSERT INTO users (email, number, username) VALUES (?, ?, ?)", req.Email, number, req.Username); err != nil {
 		http.Error(w, "create failed", http.StatusInternalServerError)
 		return
 	}
@@ -243,21 +219,21 @@ func handleExistsEmail(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"exists": exists > 0})
 }
 
-func handleUpdatePubkey(w http.ResponseWriter, r *http.Request) {
+func handleUpdatePassword(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	var req struct {
-		Email     string `json:"email"`
-		PublicKey string `json:"public_key"`
+		Email        string `json:"email"`
+		PasswordHash string `json:"password_hash"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	if req.Email == "" || req.PublicKey == "" {
-		http.Error(w, "missing email or public_key", http.StatusBadRequest)
+	if req.Email == "" || req.PasswordHash == "" {
+		http.Error(w, "missing email or password_hash", http.StatusBadRequest)
 		return
 	}
 	var number string
@@ -265,7 +241,7 @@ func handleUpdatePubkey(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "user not found", http.StatusNotFound)
 		return
 	}
-	if _, err := db.Exec("UPDATE users SET public_key = ? WHERE email = ?", req.PublicKey, req.Email); err != nil {
+	if _, err := db.Exec("UPDATE users SET password_hash = ? WHERE email = ?", req.PasswordHash, req.Email); err != nil {
 		http.Error(w, "update failed", http.StatusInternalServerError)
 		return
 	}
@@ -474,38 +450,22 @@ func handleDBWS(w http.ResponseWriter, r *http.Request) {
 				writeWSError(conn, "missing number")
 				continue
 			}
-			var email, pubkey string
-			if err := db.QueryRow("SELECT email, public_key FROM users WHERE number = ?", in.Number).Scan(&email, &pubkey); err != nil {
+			var email, username string
+			if err := db.QueryRow("SELECT email, username FROM users WHERE number = ?", in.Number).Scan(&email, &username); err != nil {
 				writeWSError(conn, "user not found")
 				continue
 			}
-			_ = conn.WriteJSON(map[string]any{"ok": true, "data": map[string]string{"email": email, "public_key": pubkey}})
-
-		case "users.getByPubkey":
-			var in struct {
-				PublicKey string `json:"public_key"`
-			}
-			if err := json.Unmarshal(req.Data, &in); err != nil || in.PublicKey == "" {
-				writeWSError(conn, "missing public_key")
-				continue
-			}
-			var number string
-			if err := db.QueryRow("SELECT number FROM users WHERE public_key = ?", in.PublicKey).Scan(&number); err != nil {
-				writeWSError(conn, "user not found")
-				continue
-			}
-			_ = conn.WriteJSON(map[string]any{"ok": true, "data": map[string]string{"number": number}})
+			_ = conn.WriteJSON(map[string]any{"ok": true, "data": map[string]string{"email": email, "username": username}})
 
 		case "users.create":
 			var in struct {
 				Email        string `json:"email"`
-				PublicKey    string `json:"public_key"`
+				Username     string `json:"username"`
 				Route        string `json:"route"`
 				PasswordHash string `json:"password_hash"`
-				EncryptedKey string `json:"encrypted_key"`
 			}
-			if err := json.Unmarshal(req.Data, &in); err != nil || in.Email == "" || in.PublicKey == "" {
-				writeWSError(conn, "missing email or public_key")
+			if err := json.Unmarshal(req.Data, &in); err != nil || in.Email == "" || in.Username == "" {
+				writeWSError(conn, "missing email or username")
 				continue
 			}
 			number, err := generateUserNumber(in.Route)
@@ -514,8 +474,8 @@ func handleDBWS(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if _, err := db.Exec(
-				"INSERT INTO users (email, number, public_key, password_hash, encrypted_key) VALUES (?, ?, ?, ?, ?)",
-				in.Email, number, in.PublicKey, in.PasswordHash, in.EncryptedKey,
+				"INSERT INTO users (email, number, username, password_hash) VALUES (?, ?, ?, ?)",
+				in.Email, number, in.Username, in.PasswordHash,
 			); err != nil {
 				writeWSError(conn, "create failed")
 				continue
@@ -537,15 +497,13 @@ func handleDBWS(w http.ResponseWriter, r *http.Request) {
 			}
 			_ = conn.WriteJSON(map[string]any{"ok": true, "data": map[string]bool{"exists": exists > 0}})
 
-		case "users.updatePubkey":
+		case "users.updatePassword":
 			var in struct {
 				Email        string `json:"email"`
-				PublicKey    string `json:"public_key"`
 				PasswordHash string `json:"password_hash"`
-				EncryptedKey string `json:"encrypted_key"`
 			}
-			if err := json.Unmarshal(req.Data, &in); err != nil || in.Email == "" || in.PublicKey == "" {
-				writeWSError(conn, "missing email or public_key")
+			if err := json.Unmarshal(req.Data, &in); err != nil || in.Email == "" || in.PasswordHash == "" {
+				writeWSError(conn, "missing email or password_hash")
 				continue
 			}
 			var number string
@@ -554,8 +512,8 @@ func handleDBWS(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if _, err := db.Exec(
-				"UPDATE users SET public_key = ?, password_hash = ?, encrypted_key = ? WHERE email = ?",
-				in.PublicKey, in.PasswordHash, in.EncryptedKey, in.Email,
+				"UPDATE users SET password_hash = ? WHERE email = ?",
+				in.PasswordHash, in.Email,
 			); err != nil {
 				writeWSError(conn, "update failed")
 				continue
@@ -564,25 +522,23 @@ func handleDBWS(w http.ResponseWriter, r *http.Request) {
 
 		case "users.getAuthInfo":
 			var in struct {
-				Email string `json:"email"`
+				Username string `json:"username"`
 			}
-			if err := json.Unmarshal(req.Data, &in); err != nil || in.Email == "" {
-				writeWSError(conn, "missing email")
+			if err := json.Unmarshal(req.Data, &in); err != nil || in.Username == "" {
+				writeWSError(conn, "missing username")
 				continue
 			}
-			var number, pubkey, passwordHash, encryptedKey string
+			var number, passwordHash string
 			if err := db.QueryRow(
-				"SELECT number, public_key, password_hash, encrypted_key FROM users WHERE email = ?",
-				in.Email,
-			).Scan(&number, &pubkey, &passwordHash, &encryptedKey); err != nil {
+				"SELECT number, password_hash FROM users WHERE username = ?",
+				in.Username,
+			).Scan(&number, &passwordHash); err != nil {
 				writeWSError(conn, "user not found")
 				continue
 			}
 			_ = conn.WriteJSON(map[string]any{"ok": true, "data": map[string]string{
 				"number":        number,
-				"public_key":    pubkey,
 				"password_hash": passwordHash,
-				"encrypted_key": encryptedKey,
 			}})
 
 		default:
@@ -619,10 +575,9 @@ func main() {
 	mux.HandleFunc("/messages/store", handleStoreMessage)
 	mux.HandleFunc("/messages/pop", handlePopMessages)
 	mux.HandleFunc("/users/get-by-number", handleGetUserByNumber)
-	mux.HandleFunc("/users/get-by-pubkey", handleGetUserByPubkey)
 	mux.HandleFunc("/users/create", handleCreateUser)
 	mux.HandleFunc("/users/exists-email", handleExistsEmail)
-	mux.HandleFunc("/users/update-pubkey", handleUpdatePubkey)
+	mux.HandleFunc("/users/update-password", handleUpdatePassword)
 
 	log.Printf("db service #%s listening on :%s", serviceNumber, port)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {

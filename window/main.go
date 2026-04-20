@@ -5,7 +5,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -273,39 +272,15 @@ func dbWSCall(action string, payload any, out any) error {
 	return lastErr
 }
 
-func getUserByNumber(number string) (email, pubkey string, err error) {
-	var out struct {
-		Email     string `json:"email"`
-		PublicKey string `json:"public_key"`
-	}
-	err = dbWSCall("users.getByNumber", map[string]string{"number": number}, &out)
-	if err != nil {
-		return "", "", err
-	}
-	return out.Email, out.PublicKey, nil
-}
-
-func getUserByPublicKey(pubkey string) (number string, err error) {
-	var out struct {
-		Number string `json:"number"`
-	}
-	err = dbWSCall("users.getByPubkey", map[string]string{"public_key": pubkey}, &out)
-	if err != nil {
-		return "", err
-	}
-	return out.Number, nil
-}
-
-func createUser(email, pubkey, passwordHash, encryptedKey string) (number string, err error) {
+func createUser(email, username, passwordHash string) (number string, err error) {
 	var out struct {
 		Number string `json:"number"`
 	}
 	err = dbWSCall("users.create", map[string]string{
 		"email":         email,
-		"public_key":    pubkey,
+		"username":      username,
 		"route":         routeNumber,
 		"password_hash": passwordHash,
-		"encrypted_key": encryptedKey,
 	}, &out)
 	if err != nil {
 		return "", err
@@ -313,15 +288,13 @@ func createUser(email, pubkey, passwordHash, encryptedKey string) (number string
 	return out.Number, nil
 }
 
-func updatePublicKey(email, newPubkey, passwordHash, encryptedKey string) (number string, err error) {
+func updatePassword(email, passwordHash string) (number string, err error) {
 	var out struct {
 		Number string `json:"number"`
 	}
-	err = dbWSCall("users.updatePubkey", map[string]string{
+	err = dbWSCall("users.updatePassword", map[string]string{
 		"email":         email,
-		"public_key":    newPubkey,
 		"password_hash": passwordHash,
-		"encrypted_key": encryptedKey,
 	}, &out)
 	if err != nil {
 		return "", err
@@ -331,14 +304,12 @@ func updatePublicKey(email, newPubkey, passwordHash, encryptedKey string) (numbe
 
 type userAuthInfo struct {
 	Number       string `json:"number"`
-	PublicKey    string `json:"public_key"`
 	PasswordHash string `json:"password_hash"`
-	EncryptedKey string `json:"encrypted_key"`
 }
 
-func getAuthInfo(email string) (*userAuthInfo, error) {
+func getAuthInfo(username string) (*userAuthInfo, error) {
 	var out userAuthInfo
-	if err := dbWSCall("users.getAuthInfo", map[string]string{"email": email}, &out); err != nil {
+	if err := dbWSCall("users.getAuthInfo", map[string]string{"username": username}, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -397,60 +368,15 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// --- メッセージ型・署名検証 ---
+// --- ノード管理 ---
 
-// Message はSMSメッセージの構造体。node/main.go と同一定義。
+// Message はSMSメッセージの構造体。
 type Message struct {
 	Timestamp int64           `json:"timestamp"`
 	Message   json.RawMessage `json:"message"`
 	To        string          `json:"to"`
 	From      string          `json:"from"`
-	Sig       string          `json:"sig"`
 }
-
-func buildMessageSigningPayload(msg *Message) map[string]any {
-	return map[string]any{
-		"timestamp": msg.Timestamp,
-		"message":   json.RawMessage(msg.Message),
-		"to":        msg.To,
-		"from":      msg.From,
-	}
-}
-
-// verifyMessageSignature はSMSメッセージの署名をwindow側で検証する。
-// DBから送信者の公開鍵を取得してECDSA検証を行う。
-func verifyMessageSignature(msg *Message) error {
-	if msg.From == "" || msg.To == "" || len(msg.Message) == 0 || msg.Timestamp == 0 || msg.Sig == "" {
-		return fmt.Errorf("missing signed fields")
-	}
-	_, pubHex, err := getUserByNumber(msg.From)
-	if err != nil {
-		return fmt.Errorf("sender not found: %w", err)
-	}
-	pubBytes, err := hex.DecodeString(pubHex)
-	if err != nil || len(pubBytes) != 64 {
-		return fmt.Errorf("invalid public key encoding")
-	}
-	sigBytes, err := hex.DecodeString(msg.Sig)
-	if err != nil || len(sigBytes) != 96 {
-		return fmt.Errorf("invalid signature encoding")
-	}
-	payload := buildMessageSigningPayload(msg)
-	normalized, err := CanonicalJSON(payload)
-	if err != nil {
-		return err
-	}
-	var pub PublicKey
-	copy(pub[:], pubBytes)
-	var sig Signature
-	copy(sig[:], sigBytes)
-	if !Verify(pub, normalized, sig) {
-		return fmt.Errorf("signature verify failed")
-	}
-	return nil
-}
-
-// --- ノード管理 ---
 
 type NodeConn struct {
 	conn *websocket.Conn
@@ -614,50 +540,7 @@ func startSeedWatcher(domain, number string) {
 
 // --- ハンドラー ---
 
-// GET /pubkey/{番号}
-func handleGetPubkey(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	number := strings.TrimPrefix(r.URL.Path, "/pubkey/")
-	_, pubkey, err := getUserByNumber(number)
-	if err != nil {
-		http.Error(w, "user not found", http.StatusNotFound)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"public_key": pubkey,
-	})
-}
-
-// POST /account/lookup - 公開鍵から番号取得
-func handleAccountLookup(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var body map[string]string
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
-	pubkey := body["public_key"]
-	if pubkey == "" {
-		http.Error(w, "missing public_key", http.StatusBadRequest)
-		return
-	}
-	number, err := getUserByPublicKey(pubkey)
-	if err != nil {
-		http.Error(w, "user not found", http.StatusNotFound)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"number": number})
-}
-
-// POST /account/new - 新規作成（メールアドレス + 公開鍵 + パスワード → 番号返却）
+// POST /account/new - 新規作成（ユーザー名 + メールアドレス + パスワード → 番号返却）
 func handleNew(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -669,11 +552,10 @@ func handleNew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	email := body["email"]
-	pubkey := body["public_key"]
+	username := body["username"]
 	password := body["password"]
-	encryptedKey := body["encrypted_key"]
-	if email == "" || pubkey == "" || password == "" || encryptedKey == "" {
-		http.Error(w, "missing email, public_key, password or encrypted_key", http.StatusBadRequest)
+	if email == "" || username == "" || password == "" {
+		http.Error(w, "missing email, username or password", http.StatusBadRequest)
 		return
 	}
 
@@ -684,7 +566,7 @@ func handleNew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	number, err := createUser(email, pubkey, string(hash), encryptedKey)
+	number, err := createUser(email, username, string(hash))
 	if err != nil {
 		log.Printf("failed to create user: %v", err)
 		http.Error(w, "creation failed", http.StatusInternalServerError)
@@ -755,11 +637,9 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := body["token"]
-	pubkey := body["public_key"]
 	password := body["password"]
-	encryptedKey := body["encrypted_key"]
-	if token == "" || pubkey == "" || password == "" || encryptedKey == "" {
-		http.Error(w, "missing token, public_key, password or encrypted_key", http.StatusBadRequest)
+	if token == "" || password == "" {
+		http.Error(w, "missing token or password", http.StatusBadRequest)
 		return
 	}
 
@@ -775,11 +655,10 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	passwordHash := string(hash)
 
-	number, err := updatePublicKey(email, pubkey, passwordHash, encryptedKey)
+	number, err := updatePassword(email, string(hash))
 	if err != nil {
-		log.Printf("failed to update public key: %v", err)
+		log.Printf("failed to update password: %v", err)
 		http.Error(w, "reset failed", http.StatusInternalServerError)
 		return
 	}
@@ -788,7 +667,7 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"number": number, "status": "ok"})
 }
 
-// POST /account/login - メール+パスワードでログイン、JWT を返す
+// POST /account/login - ユーザー名+パスワードでログイン、JWT を返す
 func handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -799,22 +678,22 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	email := body["email"]
+	username := body["username"]
 	password := body["password"]
-	if email == "" || password == "" {
-		http.Error(w, "missing email or password", http.StatusBadRequest)
+	if username == "" || password == "" {
+		http.Error(w, "missing username or password", http.StatusBadRequest)
 		return
 	}
 
-	info, err := getAuthInfo(email)
+	info, err := getAuthInfo(username)
 	if err != nil {
 		// ユーザーが見つからない場合もタイミング攻撃を防ぐため一定時間消費する
 		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$invalidhashfortimingnormalization"), []byte(password))
-		http.Error(w, "invalid email or password", http.StatusUnauthorized)
+		http.Error(w, "invalid username or password", http.StatusUnauthorized)
 		return
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(info.PasswordHash), []byte(password)); err != nil {
-		http.Error(w, "invalid email or password", http.StatusUnauthorized)
+		http.Error(w, "invalid username or password", http.StatusUnauthorized)
 		return
 	}
 
@@ -827,9 +706,8 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"token":         jwt,
-		"number":        info.Number,
-		"encrypted_key": info.EncryptedKey,
+		"token":  jwt,
+		"number": info.Number,
 	})
 }
 
@@ -846,13 +724,6 @@ func handleSMSSend(w http.ResponseWriter, r *http.Request) {
 	}
 	if msg.Timestamp == 0 {
 		msg.Timestamp = time.Now().UTC().Unix()
-	}
-
-	// 署名検証（送信者が正規ユーザーであることを確認）
-	if err := verifyMessageSignature(&msg); err != nil {
-		log.Printf("sms signature verification failed from=%s: %v", msg.From, err)
-		http.Error(w, "invalid signature", http.StatusUnauthorized)
-		return
 	}
 
 	// DBに直接保存（ノード経由ではなく window が直接保存することでHTTP/TLSの
@@ -1099,8 +970,6 @@ func main() {
 	mux := http.NewServeMux()
 
 	// アカウント管理API
-	mux.HandleFunc("/pubkey/", handleGetPubkey)
-	mux.HandleFunc("/account/lookup", handleAccountLookup)
 	mux.HandleFunc("/account/new", handleNew)
 	mux.HandleFunc("/account/reset-request", handleResetRequest)
 	mux.HandleFunc("/account/reset", handleReset)

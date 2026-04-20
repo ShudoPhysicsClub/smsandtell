@@ -28,13 +28,13 @@ async function postJSON(url: string, body: unknown): Promise<any> {
 
 export async function loginAccount(
   windowBase: string,
-  email: string,
+  username: string,
   password: string,
-): Promise<{ token: string; number: string; encrypted_key: string }> {
+): Promise<{ token: string; number: string }> {
   const data = (await postJSON(`${windowBase}/account/login`, {
-    email,
+    username,
     password,
-  })) as { token: string; number: string; encrypted_key: string };
+  })) as { token: string; number: string };
   return data;
 }
 
@@ -110,15 +110,13 @@ export async function resolveSeed(number: string): Promise<{ windowBase: string;
 export async function createAccount(
   windowBase: string,
   email: string,
-  publicKey: string,
+  username: string,
   password: string,
-  encryptedKey: string,
 ): Promise<string> {
   const data = (await postJSON(`${windowBase}/account/new`, {
     email,
-    public_key: publicKey,
+    username,
     password,
-    encrypted_key: encryptedKey,
   })) as { number: string };
   return data.number;
 }
@@ -130,15 +128,11 @@ export async function resetRequest(windowBase: string, email: string): Promise<v
 export async function resetDo(
   windowBase: string,
   token: string,
-  publicKey: string,
   password: string,
-  encryptedKey: string,
 ): Promise<string> {
   const data = (await postJSON(`${windowBase}/account/reset`, {
     token,
-    public_key: publicKey,
     password,
-    encrypted_key: encryptedKey,
   })) as { number: string; status: string };
   return data.number;
 }
@@ -148,14 +142,12 @@ export async function sendSMS(
   to: string,
   from: string,
   messageBody: string,
-  sig: string,
   timestamp: number,
 ): Promise<void> {
   await postJSON(`${windowBase}/sms/send`, {
     to,
     from,
     message: { body: messageBody },
-    sig,
     timestamp,
   });
 }
@@ -216,14 +208,4 @@ export async function sendCallHangup(
   await postJSON(`${windowBase}/call/hangup`, payload);
 }
 
-export async function getPublicKeyByNumber(windowBase: string, number: string): Promise<string> {
-  const res = await fetch(`${windowBase}/pubkey/${encodeURIComponent(number)}`);
-  if (!res.ok) {
-    throw new Error(await res.text());
-  }
-  const data = (await res.json()) as { public_key?: string };
-  if (!data.public_key) {
-    throw new Error('public key not found');
-  }
-  return data.public_key;
-}
+
