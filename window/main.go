@@ -107,10 +107,9 @@ type tokenEntry struct {
 }
 
 var (
-	emailVerifyTokens = make(map[string]tokenEntry) // token -> entry
-	resetTokens       = make(map[string]tokenEntry) // token -> entry
-	tokensMu          sync.RWMutex
-	tokenTTL          = 15 * time.Minute
+	resetTokens = make(map[string]tokenEntry) // token -> entry
+	tokensMu    sync.RWMutex
+	tokenTTL    = 15 * time.Minute
 )
 
 func generateToken() (string, error) {
@@ -136,11 +135,6 @@ func startTokenSweeper() {
 		for range ticker.C {
 			now := time.Now()
 			tokensMu.Lock()
-			for token, entry := range emailVerifyTokens {
-				if now.After(entry.ExpiresAt) {
-					delete(emailVerifyTokens, token)
-				}
-			}
 			for token, entry := range resetTokens {
 				if now.After(entry.ExpiresAt) {
 					delete(resetTokens, token)
@@ -663,75 +657,7 @@ func handleAccountLookup(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"number": number})
 }
 
-// POST /account/register - 新規登録
-func handleRegister(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var body map[string]string
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
-	email := body["email"]
-	if email == "" {
-		http.Error(w, "missing email", http.StatusBadRequest)
-		return
-	}
-
-	token, err := generateToken()
-	if err != nil {
-		log.Printf("failed to generate token: %v", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	tokensMu.Lock()
-	putToken(emailVerifyTokens, token, email)
-	tokensMu.Unlock()
-
-	// メール送信
-	subject := "Confirm your email"
-	mailBody := fmt.Sprintf("Token: %s", token)
-	if err := sendEmail(email, subject, mailBody); err != nil {
-		log.Printf("failed to send email: %v", err)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "confirmation email sent"})
-}
-
-// POST /account/verify-email - メール確認
-func handleVerifyEmail(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var body map[string]string
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
-	token := body["token"]
-	if token == "" {
-		http.Error(w, "missing token", http.StatusBadRequest)
-		return
-	}
-
-	tokensMu.RLock()
-	email, ok := getTokenEmail(emailVerifyTokens, token)
-	tokensMu.RUnlock()
-
-	if !ok {
-		http.Error(w, "invalid token", http.StatusUnauthorized)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "email": email})
-}
-
-// POST /account/new - 新規作成（トークン + 公開鍵 + パスワード → 番号返却）
+// POST /account/new - 新規作成（メールアドレス + 公開鍵 + パスワード → 番号返却）
 func handleNew(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -742,18 +668,12 @@ func handleNew(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	token := body["token"]
+	email := body["email"]
 	pubkey := body["public_key"]
 	password := body["password"]
 	encryptedKey := body["encrypted_key"]
-	if token == "" || pubkey == "" || password == "" || encryptedKey == "" {
-		http.Error(w, "missing token, public_key, password or encrypted_key", http.StatusBadRequest)
-		return
-	}
-
-	email, ok := atomicConsumeToken(emailVerifyTokens, token)
-	if !ok {
-		http.Error(w, "invalid token", http.StatusUnauthorized)
+	if email == "" || pubkey == "" || password == "" || encryptedKey == "" {
+		http.Error(w, "missing email, public_key, password or encrypted_key", http.StatusBadRequest)
 		return
 	}
 
@@ -1181,8 +1101,6 @@ func main() {
 	// アカウント管理API
 	mux.HandleFunc("/pubkey/", handleGetPubkey)
 	mux.HandleFunc("/account/lookup", handleAccountLookup)
-	mux.HandleFunc("/account/register", handleRegister)
-	mux.HandleFunc("/account/verify-email", handleVerifyEmail)
 	mux.HandleFunc("/account/new", handleNew)
 	mux.HandleFunc("/account/reset-request", handleResetRequest)
 	mux.HandleFunc("/account/reset", handleReset)

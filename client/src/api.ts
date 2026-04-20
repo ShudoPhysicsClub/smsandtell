@@ -107,19 +107,15 @@ export async function resolveSeed(number: string): Promise<{ windowBase: string;
   return { windowBase, nodeWs };
 }
 
-export async function registerEmail(windowBase: string, email: string): Promise<void> {
-  await postJSON(`${windowBase}/account/register`, { email });
-}
-
 export async function createAccount(
   windowBase: string,
-  token: string,
+  email: string,
   publicKey: string,
   password: string,
   encryptedKey: string,
 ): Promise<string> {
   const data = (await postJSON(`${windowBase}/account/new`, {
-    token,
+    email,
     public_key: publicKey,
     password,
     encrypted_key: encryptedKey,

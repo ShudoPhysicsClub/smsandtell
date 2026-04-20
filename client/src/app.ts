@@ -10,7 +10,6 @@ import {
   createAccount,
   getPublicKeyByNumber,
   loginAccount,
-  registerEmail,
   resolveSeed,
   sendCallAuthChallenge,
   sendCallAuthOK,
@@ -899,13 +898,6 @@ export function buildUI(): void {
     for (const name of keys) {
       screens[name].style.display = name === targetKey ? (name !== 'chat' ? 'flex' : 'block') : 'none';
     }
-    // サインアップ画面を開くときはステップ1に戻す
-    if (targetKey === 'signup') {
-      signupStep1.style.display = '';
-      signupStep2.style.display = 'none';
-      btnRegister.style.display = '';
-      btnCreate.style.display = 'none';
-    }
     // 再設定画面を開くときはステップ1に戻す
     if (targetKey === 'reset') {
       resetStep1.style.display = '';
@@ -1043,7 +1035,6 @@ export function buildUI(): void {
   const signupEmailInput = createInput('signupEmail', 'メールアドレス');
   signupEmailInput.type = 'email';
   signupEmailInput.autocomplete = 'email';
-  const signupTokenInput = createInput('signupToken', 'メールのトークン');
   const signupPasswordInput = createInput('signupPassword', 'パスワード（8文字以上）');
   signupPasswordInput.type = 'password';
   signupPasswordInput.autocomplete = 'new-password';
@@ -1054,28 +1045,15 @@ export function buildUI(): void {
   // 生成した秘密鍵を一時保存（入力フィールドには出さない）
   let signupGeneratedKeyHex = '';
 
-  const signupStep1 = document.createElement('div');
-  const signupStep2 = document.createElement('div');
-  signupStep2.style.display = 'none';
+  signupCard.appendChild(makeFormGroup('メールアドレス', signupEmailInput));
+  signupCard.appendChild(makeFormGroup('パスワード', signupPasswordInput));
+  signupCard.appendChild(makeFormGroup('パスワード（確認）', signupPasswordConfirmInput));
 
-  signupStep1.appendChild(makeFormGroup('メールアドレス', signupEmailInput));
-
-  // Step2
-  signupStep2.appendChild(makeFormGroup('トークン', signupTokenInput));
-  signupStep2.appendChild(makeFormGroup('パスワード', signupPasswordInput));
-  signupStep2.appendChild(makeFormGroup('パスワード（確認）', signupPasswordConfirmInput));
-
-  signupCard.appendChild(signupStep1);
-  signupCard.appendChild(signupStep2);
-
-  const btnRegister = makePrimaryBtn('btnRegisterEmail', '確認メール送信');
   const btnCreate = makePrimaryBtn('btnCreateAccount', 'アカウント作成');
-  btnCreate.style.display = 'none';
   const signupButtonWrap = document.createElement('div');
   signupButtonWrap.style.display = 'flex';
   signupButtonWrap.style.flexDirection = 'column';
   signupButtonWrap.style.gap = '8px';
-  signupButtonWrap.appendChild(btnRegister);
   signupButtonWrap.appendChild(btnCreate);
   signupCard.appendChild(signupButtonWrap);
   signupCard.appendChild(makeLinkBtn('すでにアカウントをお持ちの方', () => setActiveScreen('login')));
@@ -1955,45 +1933,28 @@ export function buildUI(): void {
     }
   };
 
-  btnRegister.onclick = async () => {
-    try {
-      await registerEmail(windowBase, signupEmailInput.value.trim());
-      setStatus('確認メールを送信しました。トークンを入力してください。');
-      signupStep1.style.display = 'none';
-      signupStep2.style.display = 'block';
-      btnRegister.style.display = 'none';
-      btnCreate.style.display = '';
-      // 秘密鍵を生成しておく（バックグラウンドで）
-      generateMnemonic().then(({ privateKeyHex }) => {
-        signupGeneratedKeyHex = privateKeyHex;
-      }).catch(() => {});
-      signupTokenInput.focus();
-    } catch (err) {
-      setErrorStatus(err);
-    }
-  };
-
   btnCreate.onclick = async () => {
     try {
+      const email = signupEmailInput.value.trim();
+      if (!email) throw new Error('メールアドレスを入力してください');
       const password = signupPasswordInput.value;
       const passwordConfirm = signupPasswordConfirmInput.value;
       if (!password) throw new Error('パスワードを入力してください');
       validateSavePassword(password);
       if (password !== passwordConfirm) throw new Error('パスワードが一致しません');
       if (!signupGeneratedKeyHex) {
-        // まだ生成が完了していない場合は生成する
         const { privateKeyHex } = await generateMnemonic();
         signupGeneratedKeyHex = privateKeyHex;
       }
       const privateKeyHex = signupGeneratedKeyHex;
       const pubHex = derivePublicKeyHex(privateKeyHex);
       const encryptedKey = await encryptPrivateKey(privateKeyHex, password);
-      const number = await createAccount(windowBase, signupTokenInput.value.trim(), pubHex, password, encryptedKey);
+      const number = await createAccount(windowBase, email, pubHex, password, encryptedKey);
       setStatus(`account created: ${number}`);
       currentNumber = number;
-      localStorage.setItem(LS_EMAIL, signupEmailInput.value.trim());
+      localStorage.setItem(LS_EMAIL, email);
       localStorage.setItem(LS_NUMBER, number);
-      loginEmailInput.value = signupEmailInput.value.trim();
+      loginEmailInput.value = email;
       setActiveScreen('login');
     } catch (err) {
       setErrorStatus(err);
