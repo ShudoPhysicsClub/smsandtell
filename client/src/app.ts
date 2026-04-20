@@ -1042,9 +1042,6 @@ export function buildUI(): void {
   signupPasswordConfirmInput.type = 'password';
   signupPasswordConfirmInput.autocomplete = 'new-password';
 
-  // 生成した秘密鍵を一時保存（入力フィールドには出さない）
-  let signupGeneratedKeyHex = '';
-
   signupCard.appendChild(makeFormGroup('メールアドレス', signupEmailInput));
   signupCard.appendChild(makeFormGroup('パスワード', signupPasswordInput));
   signupCard.appendChild(makeFormGroup('パスワード（確認）', signupPasswordConfirmInput));
@@ -1942,11 +1939,7 @@ export function buildUI(): void {
       if (!password) throw new Error('パスワードを入力してください');
       validateSavePassword(password);
       if (password !== passwordConfirm) throw new Error('パスワードが一致しません');
-      if (!signupGeneratedKeyHex) {
-        const { privateKeyHex } = await generateMnemonic();
-        signupGeneratedKeyHex = privateKeyHex;
-      }
-      const privateKeyHex = signupGeneratedKeyHex;
+      const { privateKeyHex } = await generateMnemonic();
       const pubHex = derivePublicKeyHex(privateKeyHex);
       const encryptedKey = await encryptPrivateKey(privateKeyHex, password);
       const number = await createAccount(windowBase, email, pubHex, password, encryptedKey);
