@@ -2,6 +2,9 @@ package main
 
 import (
 	crand "crypto/rand"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -16,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/crypto/bcrypt"
 )
 
 var upgrader = websocket.Upgrader{
@@ -28,13 +32,72 @@ var seedDomain string
 var routeNumber string // このwindowサーバーのルーティングプレフィックス（例: "02"）
 var dbWSConn *websocket.Conn
 var dbWSMu sync.Mutex
+var jwtSecret []byte
 
 const fixedSeedDomain = "manh2309.org"
 
 const (
-	dbWSRetries = 3
-	dbWSTimeout = 5 * time.Second
+	dbWSRetries    = 3
+	dbWSTimeout    = 5 * time.Second
+	jwtTokenExpiry = 24 * time.Hour
 )
+
+// --- JWT（HS256、標準ライブラリのみ使用） ---
+
+func base64URLEncode(b []byte) string {
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func base64URLDecode(s string) ([]byte, error) {
+	return base64.RawURLEncoding.DecodeString(s)
+}
+
+// issueJWT は number を subject とした HS256 JWT を発行する。
+func issueJWT(number string) (string, error) {
+	header := base64URLEncode([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	now := time.Now().Unix()
+	exp := time.Now().Add(jwtTokenExpiry).Unix()
+	payloadJSON := fmt.Sprintf(`{"sub":%q,"iat":%d,"exp":%d}`, number, now, exp)
+	payload := base64URLEncode([]byte(payloadJSON))
+	msg := header + "." + payload
+	mac := hmac.New(sha256.New, jwtSecret)
+	mac.Write([]byte(msg))
+	sig := base64URLEncode(mac.Sum(nil))
+	return msg + "." + sig, nil
+}
+
+// verifyJWT は JWT を検証して subject（number）を返す。
+func verifyJWT(token string) (string, error) {
+	parts := strings.SplitN(token, ".", 3)
+	if len(parts) != 3 {
+		return "", fmt.Errorf("invalid token format")
+	}
+	msg := parts[0] + "." + parts[1]
+	mac := hmac.New(sha256.New, jwtSecret)
+	mac.Write([]byte(msg))
+	expected := base64URLEncode(mac.Sum(nil))
+	if !hmac.Equal([]byte(expected), []byte(parts[2])) {
+		return "", fmt.Errorf("invalid token signature")
+	}
+	payloadBytes, err := base64URLDecode(parts[1])
+	if err != nil {
+		return "", fmt.Errorf("invalid token payload")
+	}
+	var claims struct {
+		Sub string `json:"sub"`
+		Exp int64  `json:"exp"`
+	}
+	if err := json.Unmarshal(payloadBytes, &claims); err != nil {
+		return "", fmt.Errorf("invalid token claims")
+	}
+	if time.Now().Unix() > claims.Exp {
+		return "", fmt.Errorf("token expired")
+	}
+	if claims.Sub == "" {
+		return "", fmt.Errorf("empty subject")
+	}
+	return claims.Sub, nil
+}
 
 // --- トークン管理（メモリ） ---
 
@@ -239,26 +302,52 @@ func getUserByPublicKey(pubkey string) (number string, err error) {
 	return out.Number, nil
 }
 
-func createUser(email string, pubkey string) (number string, err error) {
+func createUser(email, pubkey, passwordHash, encryptedKey string) (number string, err error) {
 	var out struct {
 		Number string `json:"number"`
 	}
-	err = dbWSCall("users.create", map[string]string{"email": email, "public_key": pubkey, "route": routeNumber}, &out)
+	err = dbWSCall("users.create", map[string]string{
+		"email":         email,
+		"public_key":    pubkey,
+		"route":         routeNumber,
+		"password_hash": passwordHash,
+		"encrypted_key": encryptedKey,
+	}, &out)
 	if err != nil {
 		return "", err
 	}
 	return out.Number, nil
 }
 
-func updatePublicKey(email string, newPubkey string) (number string, err error) {
+func updatePublicKey(email, newPubkey, passwordHash, encryptedKey string) (number string, err error) {
 	var out struct {
 		Number string `json:"number"`
 	}
-	err = dbWSCall("users.updatePubkey", map[string]string{"email": email, "public_key": newPubkey}, &out)
+	err = dbWSCall("users.updatePubkey", map[string]string{
+		"email":         email,
+		"public_key":    newPubkey,
+		"password_hash": passwordHash,
+		"encrypted_key": encryptedKey,
+	}, &out)
 	if err != nil {
 		return "", err
 	}
 	return out.Number, nil
+}
+
+type userAuthInfo struct {
+	Number       string `json:"number"`
+	PublicKey    string `json:"public_key"`
+	PasswordHash string `json:"password_hash"`
+	EncryptedKey string `json:"encrypted_key"`
+}
+
+func getAuthInfo(email string) (*userAuthInfo, error) {
+	var out userAuthInfo
+	if err := dbWSCall("users.getAuthInfo", map[string]string{"email": email}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 func userExistsByEmail(email string) (bool, error) {
@@ -642,7 +731,7 @@ func handleVerifyEmail(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "email": email})
 }
 
-// POST /account/new - 新規作成（トークン + 公開鍵 → 番号返却）
+// POST /account/new - 新規作成（トークン + 公開鍵 + パスワード → 番号返却）
 func handleNew(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -655,8 +744,10 @@ func handleNew(w http.ResponseWriter, r *http.Request) {
 	}
 	token := body["token"]
 	pubkey := body["public_key"]
-	if token == "" || pubkey == "" {
-		http.Error(w, "missing token or public_key", http.StatusBadRequest)
+	password := body["password"]
+	encryptedKey := body["encrypted_key"]
+	if token == "" || pubkey == "" || password == "" || encryptedKey == "" {
+		http.Error(w, "missing token, public_key, password or encrypted_key", http.StatusBadRequest)
 		return
 	}
 
@@ -666,7 +757,14 @@ func handleNew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	number, err := createUser(email, pubkey)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		log.Printf("failed to hash password: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	number, err := createUser(email, pubkey, string(hash), encryptedKey)
 	if err != nil {
 		log.Printf("failed to create user: %v", err)
 		http.Error(w, "creation failed", http.StatusInternalServerError)
@@ -738,8 +836,10 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 	}
 	token := body["token"]
 	pubkey := body["public_key"]
-	if token == "" || pubkey == "" {
-		http.Error(w, "missing token or public_key", http.StatusBadRequest)
+	password := body["password"]
+	encryptedKey := body["encrypted_key"]
+	if token == "" || pubkey == "" || password == "" || encryptedKey == "" {
+		http.Error(w, "missing token, public_key, password or encrypted_key", http.StatusBadRequest)
 		return
 	}
 
@@ -749,7 +849,15 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	number, err := updatePublicKey(email, pubkey)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		log.Printf("failed to hash password: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	passwordHash := string(hash)
+
+	number, err := updatePublicKey(email, pubkey, passwordHash, encryptedKey)
 	if err != nil {
 		log.Printf("failed to update public key: %v", err)
 		http.Error(w, "reset failed", http.StatusInternalServerError)
@@ -758,6 +866,51 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"number": number, "status": "ok"})
+}
+
+// POST /account/login - メール+パスワードでログイン、JWT を返す
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body map[string]string
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	email := body["email"]
+	password := body["password"]
+	if email == "" || password == "" {
+		http.Error(w, "missing email or password", http.StatusBadRequest)
+		return
+	}
+
+	info, err := getAuthInfo(email)
+	if err != nil {
+		// ユーザーが見つからない場合もタイミング攻撃を防ぐため一定時間消費する
+		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$invalidhashfortimingnormalization"), []byte(password))
+		http.Error(w, "invalid email or password", http.StatusUnauthorized)
+		return
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(info.PasswordHash), []byte(password)); err != nil {
+		http.Error(w, "invalid email or password", http.StatusUnauthorized)
+		return
+	}
+
+	jwt, err := issueJWT(info.Number)
+	if err != nil {
+		log.Printf("failed to issue JWT: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"token":         jwt,
+		"number":        info.Number,
+		"encrypted_key": info.EncryptedKey,
+	})
 }
 
 // POST /sms/send
@@ -996,6 +1149,13 @@ func main() {
 	initTokenConfig()
 	startTokenSweeper()
 
+	// JWT シークレット
+	jwtSecretStr := os.Getenv("JWT_SECRET")
+	if jwtSecretStr == "" {
+		log.Fatal("JWT_SECRET is required")
+	}
+	jwtSecret = []byte(jwtSecretStr)
+
 	// DBサービス初期化
 	if err := initDBService(); err != nil {
 		log.Fatal(err)
@@ -1026,6 +1186,7 @@ func main() {
 	mux.HandleFunc("/account/new", handleNew)
 	mux.HandleFunc("/account/reset-request", handleResetRequest)
 	mux.HandleFunc("/account/reset", handleReset)
+	mux.HandleFunc("/account/login", handleLogin)
 
 	// SMS・内部通信
 	mux.HandleFunc("/sms/send", handleSMSSend)

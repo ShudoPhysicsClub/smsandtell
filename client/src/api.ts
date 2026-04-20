@@ -1,6 +1,5 @@
 import type { NodeResolveResponse } from './types';
 
-type LookupResponse = { number: string };
 const FIXED_SEED_DOMAIN = 'manh2309.org';
 
 function createRequestId(): string {
@@ -27,11 +26,16 @@ async function postJSON(url: string, body: unknown): Promise<any> {
   return res.json();
 }
 
-export async function lookupNumber(windowBase: string, publicKey: string): Promise<string> {
-  const data = (await postJSON(`${windowBase}/account/lookup`, {
-    public_key: publicKey,
-  })) as LookupResponse;
-  return data.number;
+export async function loginAccount(
+  windowBase: string,
+  email: string,
+  password: string,
+): Promise<{ token: string; number: string; encrypted_key: string }> {
+  const data = (await postJSON(`${windowBase}/account/login`, {
+    email,
+    password,
+  })) as { token: string; number: string; encrypted_key: string };
+  return data;
 }
 
 function seedLabelFromNumber(number: string): string {
@@ -103,18 +107,22 @@ export async function resolveSeed(number: string): Promise<{ windowBase: string;
   return { windowBase, nodeWs };
 }
 
-export async function resolveNodeWS(windowBase: string, number: string): Promise<NodeResolveResponse> {
-  return (await postJSON(`${windowBase}/node/resolve`, { number })) as NodeResolveResponse;
-}
-
 export async function registerEmail(windowBase: string, email: string): Promise<void> {
   await postJSON(`${windowBase}/account/register`, { email });
 }
 
-export async function createAccount(windowBase: string, token: string, publicKey: string): Promise<string> {
+export async function createAccount(
+  windowBase: string,
+  token: string,
+  publicKey: string,
+  password: string,
+  encryptedKey: string,
+): Promise<string> {
   const data = (await postJSON(`${windowBase}/account/new`, {
     token,
     public_key: publicKey,
+    password,
+    encrypted_key: encryptedKey,
   })) as { number: string };
   return data.number;
 }
@@ -123,10 +131,18 @@ export async function resetRequest(windowBase: string, email: string): Promise<v
   await postJSON(`${windowBase}/account/reset-request`, { email });
 }
 
-export async function resetDo(windowBase: string, token: string, publicKey: string): Promise<string> {
+export async function resetDo(
+  windowBase: string,
+  token: string,
+  publicKey: string,
+  password: string,
+  encryptedKey: string,
+): Promise<string> {
   const data = (await postJSON(`${windowBase}/account/reset`, {
     token,
     public_key: publicKey,
+    password,
+    encrypted_key: encryptedKey,
   })) as { number: string; status: string };
   return data.number;
 }

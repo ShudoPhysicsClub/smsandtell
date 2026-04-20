@@ -1,7 +1,9 @@
 package main
 
 import (
-	"crypto/rand"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -16,6 +18,45 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+var jwtSecret []byte
+
+func base64URLDecode(s string) ([]byte, error) {
+	return base64.RawURLEncoding.DecodeString(s)
+}
+
+// verifyJWT は JWT を検証して subject（number）を返す。
+func verifyJWT(token string) (string, error) {
+	parts := strings.SplitN(token, ".", 3)
+	if len(parts) != 3 {
+		return "", fmt.Errorf("invalid token format")
+	}
+	msg := parts[0] + "." + parts[1]
+	mac := hmac.New(sha256.New, jwtSecret)
+	mac.Write([]byte(msg))
+	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	if !hmac.Equal([]byte(expected), []byte(parts[2])) {
+		return "", fmt.Errorf("invalid token signature")
+	}
+	payloadBytes, err := base64URLDecode(parts[1])
+	if err != nil {
+		return "", fmt.Errorf("invalid token payload")
+	}
+	var claims struct {
+		Sub string `json:"sub"`
+		Exp int64  `json:"exp"`
+	}
+	if err := json.Unmarshal(payloadBytes, &claims); err != nil {
+		return "", fmt.Errorf("invalid token claims")
+	}
+	if time.Now().Unix() > claims.Exp {
+		return "", fmt.Errorf("token expired")
+	}
+	if claims.Sub == "" {
+		return "", fmt.Errorf("empty subject")
+	}
+	return claims.Sub, nil
+}
 
 var dbServiceURL string
 var dbServiceToken string
@@ -227,58 +268,11 @@ func buildMessageSigningPayload(msg *Message) map[string]any {
 }
 
 func consumeChallenge(userID, challenge string) bool {
-	challengesMu.Lock()
-	defer challengesMu.Unlock()
-	items, ok := challenges[userID]
-	if !ok {
-		return false
-	}
-	exp, ok := items[challenge]
-	if !ok {
-		return false
-	}
-	t, err := time.Parse(time.RFC3339, exp)
-	if err != nil || time.Now().After(t) {
-		delete(items, challenge)
-		return false
-	}
-	delete(items, challenge)
-	return true
+	return false // チャレンジ認証は廃止（JWT認証に移行）
 }
 
 func verifyAuthSignature(userID, challenge, sigHex string) error {
-	if !consumeChallenge(userID, challenge) {
-		return fmt.Errorf("invalid challenge")
-	}
-	pubHex, err := getPublicKeyByNumber(userID)
-	if err != nil {
-		return err
-	}
-	pubBytes, err := hex.DecodeString(pubHex)
-	if err != nil || len(pubBytes) != 64 {
-		return fmt.Errorf("invalid public key encoding")
-	}
-	sigBytes, err := hex.DecodeString(sigHex)
-	if err != nil || len(sigBytes) != 96 {
-		return fmt.Errorf("invalid signature encoding")
-	}
-	payload := buildAuthSigningPayload(userID, challenge)
-	normalized, err := CanonicalJSON(payload)
-	if err != nil {
-		return err
-	}
-	var pub PublicKey
-	copy(pub[:], pubBytes)
-	var sig Signature
-	copy(sig[:], sigBytes)
-	if !Verify(pub, normalized, sig) {
-		return fmt.Errorf("signature verify failed")
-	}
-	return nil
-}
-
-func buildAuthSigningPayload(number, challenge string) map[string]any {
-	return map[string]any{"number": number, "challenge": challenge}
+	return fmt.Errorf("challenge-response auth is removed")
 }
 
 func saveMessage(msg *Message) error {
@@ -329,46 +323,10 @@ var (
 	challengesMu sync.RWMutex
 )
 
-// startChallengeSweeper は期限切れチャレンジを定期的にメモリから削除する。
-// 認証を完了しないままの接続が残した場合でもメモリリークしないようにする。
-func startChallengeSweeper() {
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			now := time.Now()
-			challengesMu.Lock()
-			for userID, items := range challenges {
-				for ch, exp := range items {
-					t, err := time.Parse(time.RFC3339, exp)
-					if err != nil || now.After(t) {
-						delete(items, ch)
-					}
-				}
-				if len(items) == 0 {
-					delete(challenges, userID)
-				}
-			}
-			challengesMu.Unlock()
-		}
-	}()
-}
+func startChallengeSweeper() {} // チャレンジ認証は廃止（JWT認証に移行）
 
 func generateChallenge(userID string) (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	challenge := fmt.Sprintf("%x", b)
-
-	challengesMu.Lock()
-	if challenges[userID] == nil {
-		challenges[userID] = make(map[string]string)
-	}
-	challenges[userID][challenge] = time.Now().Add(5 * time.Minute).Format(time.RFC3339)
-	challengesMu.Unlock()
-
-	return challenge, nil
+	return "", fmt.Errorf("challenge-response auth is removed")
 }
 
 func handleClientWS(w http.ResponseWriter, r *http.Request) {
@@ -379,36 +337,66 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	_, userIDBytes, err := conn.ReadMessage()
-	if err != nil {
-		log.Println("failed to read user id:", err)
+	// 最初のメッセージで JWT 認証を行う
+	var authMsg struct {
+		Action string `json:"action"`
+		Number string `json:"number"`
+		Token  string `json:"token"`
+	}
+	if err := conn.ReadJSON(&authMsg); err != nil {
+		log.Println("failed to read auth message:", err)
+		return
+	}
+	if authMsg.Action != "auth" || authMsg.Token == "" {
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"expected auth action with token"}`))
 		return
 	}
 
-	userIDStr := strings.TrimSpace(string(userIDBytes))
+	// JWT 検証
+	claimedNumber, err := verifyJWT(authMsg.Token)
+	if err != nil {
+		log.Printf("JWT verification failed: %v", err)
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"auth failed"}`))
+		return
+	}
+
+	// JWT の sub とリクエストの number が一致することを確認
+	userIDStr := strings.TrimSpace(claimedNumber)
 	if userIDStr == "" || len(userIDStr) > 128 {
-		// 空文字または過剰長の userID は拒否して接続を閉じる
 		conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"invalid user id"}`))
 		return
 	}
-	client := &ClientConn{conn: conn, userID: userIDStr}
+	if authMsg.Number != "" && strings.TrimSpace(authMsg.Number) != userIDStr {
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"number mismatch"}`))
+		return
+	}
+
+	client := &ClientConn{conn: conn, userID: userIDStr, authed: true}
 
 	clientsMu.Lock()
 	clients[userIDStr] = client
 	clientsMu.Unlock()
 	log.Printf("client connected: %s", userIDStr)
-	authenticated := false
 
 	defer func() {
 		clientsMu.Lock()
-		// 再接続で同じ userID の新しい ClientConn がすでに登録されている場合は
-		// 古い goroutine の defer が新しい接続を誤って削除しないようにする。
 		if clients[userIDStr] == client {
 			delete(clients, userIDStr)
 		}
 		clientsMu.Unlock()
 		log.Printf("client disconnected: %s", userIDStr)
 	}()
+
+	// 認証成功を通知し、保留メッセージを配信する
+	if err := client.sendJSON(map[string]string{"status": "authenticated"}); err != nil {
+		return
+	}
+	messages, err := popMessages(userIDStr)
+	if err == nil && len(messages) > 0 {
+		if err := client.sendJSON(map[string]any{"action": "messages", "messages": messages}); err != nil {
+			log.Printf("failed to send cached messages: %v", err)
+		}
+	}
 
 	for {
 		var req map[string]interface{}
@@ -423,44 +411,7 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 		}
 
 		switch action {
-		case "challenge":
-			challenge, err := generateChallenge(userIDStr)
-			if err != nil {
-				log.Printf("failed to generate challenge for %s: %v", userIDStr, err)
-				client.sendJSON(map[string]string{"error": "internal error"})
-				continue
-			}
-			client.sendJSON(map[string]string{"challenge": challenge})
-
-		case "auth_verify":
-			challenge, _ := req["challenge"].(string)
-			sig, _ := req["sig"].(string)
-			if challenge == "" || sig == "" {
-				client.sendJSON(map[string]string{"error": "missing challenge or sig"})
-				continue
-			}
-			if err := verifyAuthSignature(userIDStr, challenge, sig); err != nil {
-				client.sendJSON(map[string]string{"error": "auth failed"})
-				continue
-			}
-			authenticated = true
-			client.mu.Lock()
-			client.authed = true
-			client.mu.Unlock()
-			client.sendJSON(map[string]string{"status": "authenticated"})
-
-			messages, err := popMessages(userIDStr)
-			if err == nil && len(messages) > 0 {
-				if err := client.sendJSON(map[string]interface{}{"action": "messages", "messages": messages}); err != nil {
-					log.Printf("failed to send cached messages: %v", err)
-				}
-			}
-
 		case "send_message":
-			if !authenticated {
-				client.sendJSON(map[string]string{"error": "not authenticated"})
-				continue
-			}
 			msgData, _ := json.Marshal(req["data"])
 			var msg Message
 			if err := json.Unmarshal(msgData, &msg); err != nil {
@@ -573,6 +524,12 @@ func handleStoreMessage(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	jwtSecretStr := os.Getenv("JWT_SECRET")
+	if jwtSecretStr == "" {
+		log.Fatal("JWT_SECRET is required")
+	}
+	jwtSecret = []byte(jwtSecretStr)
+
 	if err := initDBService(); err != nil {
 		log.Fatal(err)
 	}
