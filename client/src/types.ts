@@ -14,4 +14,4 @@ export type NodeInbound = {
   error?: string;
 };
 
-export type ScreenKey = 'login' | 'signup' | 'reset' | 'chat';
+export type ScreenKey = 'login' | 'signup' | 'chat';

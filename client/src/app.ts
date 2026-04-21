@@ -6,14 +6,12 @@ import {
   toErrorText,
 } from './dom';
 import {
+  SERVER_BASE,
+  SERVER_WS,
   createAccount,
   loginAccount,
-  resolveSeed,
   sendCallAuthOK,
   sendCallHangup,
-  sendCallReject,
-  resetDo,
-  resetRequest,
   sendICEAnswer,
   sendICECandidate,
   sendICEOffer,
@@ -21,8 +19,8 @@ import {
 } from './api';
 import type { NodeInbound, ScreenKey } from './types';
 
-let windowBase = 'https://WINDOW_SERVER_HOST:30000';
-let nodeWsUrl = '';
+let windowBase = SERVER_BASE;
+let nodeWsUrl = SERVER_WS;
 let nodeSocket: WebSocket | null = null;
 let currentNumber = '';
 let isAuthenticated = false;
@@ -64,7 +62,6 @@ let lastToastKey = '';
 let lastToastAt = 0;
 let lastToastCount = 0;
 
-const LS_WINDOW_BASE = 'smsandtell.windowBase';
 const LS_NUMBER = 'smsandtell.number';
 const LS_USERNAME = 'smsandtell.username';
 const CHAT_DB_NAME = 'smsandtell-chat';
@@ -479,7 +476,7 @@ async function ensurePeerForTarget(target: string): Promise<RTCPeerConnection> {
   };
   pc.onicecandidate = (event) => {
     if (!event.candidate || !activeCallPeer) return;
-    void sendICECandidate(windowBase, { from: currentNumber, to: activeCallPeer, candidate: event.candidate.toJSON() });
+    void sendICECandidate(windowBase, { from: currentNumber, to: activeCallPeer, candidate: event.candidate.toJSON() }, currentJWT);
   };
   pc.onconnectionstatechange = () => {
     if (syncCallRuntimeRef) syncCallRuntimeRef();
@@ -508,7 +505,7 @@ async function handleSignalAction(action: string, payload: unknown): Promise<voi
     }
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-    await sendICEAnswer(windowBase, { from: currentNumber, to: from, answer: pc.localDescription?.toJSON() ?? answer });
+    await sendICEAnswer(windowBase, { from: currentNumber, to: from, answer: pc.localDescription?.toJSON() ?? answer }, currentJWT);
     setStatus('incoming offer accepted automatically');
     return;
   }
@@ -523,7 +520,7 @@ async function handleSignalAction(action: string, payload: unknown): Promise<voi
       await callPeer.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
     }
     // 認証不要: ICEアンサー受信後にすぐ call_auth_ok を送信して通話開始
-    await sendCallAuthOK(windowBase, { from: currentNumber, to: from });
+    await sendCallAuthOK(windowBase, { from: currentNumber, to: from }, currentJWT);
     setCallPhase('in_call', `${from} と通話中`);
     setStatus('call connected');
     return;
@@ -666,23 +663,13 @@ export function buildUI(): void {
         ? 'chat'
         : key;
     activeScreenKey = targetKey;
-    const keys: ScreenKey[] = ['login', 'signup', 'reset', 'chat'];
+    const keys: ScreenKey[] = ['login', 'signup', 'chat'];
     for (const name of keys) {
       screens[name].style.display = name === targetKey ? (name !== 'chat' ? 'flex' : 'block') : 'none';
-    }
-    // 再設定画面を開くときはステップ1に戻す
-    if (targetKey === 'reset') {
-      resetStep1.style.display = '';
-      resetStep2.style.display = 'none';
-      btnResetReq.style.display = '';
-      btnResetDo.style.display = 'none';
     }
     syncAuthUI();
   };
   setActiveScreenRef = setActiveScreen;
-
-  const initialWindowBase = localStorage.getItem(LS_WINDOW_BASE) ?? windowBase;
-  windowBase = initialWindowBase;
 
   // --- カード型ヘルパー ---
   const makeCard = (title: string): HTMLDivElement => {
@@ -796,7 +783,6 @@ export function buildUI(): void {
   loginCard.appendChild(btnLookupConnect);
 
   loginCard.appendChild(makeLinkBtn('新規登録はこちら', () => setActiveScreen('signup')));
-  loginCard.appendChild(makeLinkBtn('パスワードを忘れた方', () => setActiveScreen('reset')));
   loginScreen.appendChild((loginCard as unknown as { __outerWrap?: HTMLElement }).__outerWrap ?? loginCard);
 
   // --- 新規登録画面 ---
@@ -807,9 +793,6 @@ export function buildUI(): void {
   const signupUsernameInput = createInput('signupUsername', 'ユーザー名');
   signupUsernameInput.type = 'text';
   signupUsernameInput.autocomplete = 'username';
-  const signupEmailInput = createInput('signupEmail', 'メールアドレス（パスワードリセット用）');
-  signupEmailInput.type = 'email';
-  signupEmailInput.autocomplete = 'email';
   const signupPasswordInput = createInput('signupPassword', 'パスワード（8文字以上）');
   signupPasswordInput.type = 'password';
   signupPasswordInput.autocomplete = 'new-password';
@@ -818,7 +801,6 @@ export function buildUI(): void {
   signupPasswordConfirmInput.autocomplete = 'new-password';
 
   signupCard.appendChild(makeFormGroup('ユーザー名', signupUsernameInput));
-  signupCard.appendChild(makeFormGroup('メールアドレス', signupEmailInput));
   signupCard.appendChild(makeFormGroup('パスワード', signupPasswordInput));
   signupCard.appendChild(makeFormGroup('パスワード（確認）', signupPasswordConfirmInput));
 
@@ -832,41 +814,15 @@ export function buildUI(): void {
   signupCard.appendChild(makeLinkBtn('すでにアカウントをお持ちの方', () => setActiveScreen('login')));
   signupScreen.appendChild((signupCard as unknown as { __outerWrap?: HTMLElement }).__outerWrap ?? signupCard);
 
-  // --- 再設定画面 ---
-  const resetScreen = document.createElement('div');
-  resetScreen.style.cssText = 'width:100%;background:linear-gradient(135deg,#13111c 0%,#1d1b31 50%,#111827 100%);display:flex;justify-content:center;align-items:center;padding:40px 16px;box-sizing:border-box;min-height:100%';
-  const resetCard = makeCard('パスワード再設定');
-
-  const resetEmailInput = createInput('resetEmail', 'メールアドレス');
-  resetEmailInput.type = 'email';
-  resetEmailInput.autocomplete = 'email';
-  const resetTokenInput = createInput('resetToken', '再設定トークン');
-  const resetPasswordInput = createInput('resetPassword', '新しいパスワード（8文字以上）');
-  resetPasswordInput.type = 'password';
-  resetPasswordInput.autocomplete = 'new-password';
-  const resetPasswordConfirmInput = createInput('resetPasswordConfirm', '新しいパスワード（確認）');
-  resetPasswordConfirmInput.type = 'password';
-  resetPasswordConfirmInput.autocomplete = 'new-password';
-
-  const resetStep1 = document.createElement('div');
-  const resetStep2 = document.createElement('div');
-  resetStep2.style.display = 'none';
-
-  resetStep1.appendChild(makeFormGroup('メールアドレス', resetEmailInput));
-
-  resetStep2.appendChild(makeFormGroup('トークン', resetTokenInput));
-  resetStep2.appendChild(makeFormGroup('新しいパスワード', resetPasswordInput));
-  resetStep2.appendChild(makeFormGroup('新しいパスワード（確認）', resetPasswordConfirmInput));
-
   const syncResponsiveUI = (): void => {
     const isNarrow = window.innerWidth < 640;
 
-    for (const screen of [loginScreen, signupScreen, resetScreen]) {
+    for (const screen of [loginScreen, signupScreen]) {
       screen.style.alignItems = isNarrow ? 'flex-start' : 'center';
       screen.style.padding = isNarrow ? '20px 12px 24px 12px' : '40px 16px';
     }
 
-    for (const card of [loginCard, signupCard, resetCard]) {
+    for (const card of [loginCard, signupCard]) {
       card.style.padding = isNarrow ? '28px 20px 24px 20px' : '52px 48px 44px 48px';
       card.style.borderRadius = isNarrow ? '18px' : '24px';
     }
@@ -880,22 +836,6 @@ export function buildUI(): void {
 
   syncResponsiveUI();
   window.addEventListener('resize', syncResponsiveUI);
-
-  resetCard.appendChild(resetStep1);
-  resetCard.appendChild(resetStep2);
-
-  const btnResetReq = makePrimaryBtn('btnResetRequest', '再設定メール送信');
-  const btnResetDo = makePrimaryBtn('btnResetDo', '再設定を実行');
-  btnResetDo.style.display = 'none';
-  const resetButtonWrap = document.createElement('div');
-  resetButtonWrap.style.display = 'flex';
-  resetButtonWrap.style.flexDirection = 'column';
-  resetButtonWrap.style.gap = '8px';
-  resetButtonWrap.appendChild(btnResetReq);
-  resetButtonWrap.appendChild(btnResetDo);
-  resetCard.appendChild(resetButtonWrap);
-  resetCard.appendChild(makeLinkBtn('ログインに戻る', () => setActiveScreen('login')));
-  resetScreen.appendChild((resetCard as unknown as { __outerWrap?: HTMLElement }).__outerWrap ?? resetCard);
 
   const chatScreen = createSection('会話画面');
   chatScreen.style.background = 'transparent';
@@ -1589,10 +1529,9 @@ export function buildUI(): void {
 
   screens.login = loginScreen;
   screens.signup = signupScreen;
-  screens.reset = resetScreen;
   screens.chat = chatScreen;
 
-  const screenKeys: ScreenKey[] = ['login', 'signup', 'reset', 'chat'];
+  const screenKeys: ScreenKey[] = ['login', 'signup', 'chat'];
   for (const key of screenKeys) {
     screenHost.appendChild(screens[key]);
   }
@@ -1636,9 +1575,6 @@ export function buildUI(): void {
       if (!username) throw new Error('ユーザー名を入力してください');
       if (!password) throw new Error('パスワードを入力してください');
 
-      const savedWindowBase = localStorage.getItem(LS_WINDOW_BASE) ?? windowBase;
-      windowBase = savedWindowBase;
-
       if (!opts?.silent) setStatus('ログイン中...');
       const loginResult = await loginAccount(windowBase, username, password);
 
@@ -1648,13 +1584,7 @@ export function buildUI(): void {
       localStorage.setItem(LS_USERNAME, username);
       localStorage.setItem(LS_NUMBER, currentNumber);
 
-      const seed = await resolveSeed(currentNumber);
-      windowBase = seed.windowBase;
-      localStorage.setItem(LS_WINDOW_BASE, windowBase);
-
-      nodeWsUrl = seed.nodeWs;
-      if (!nodeWsUrl) throw new Error('node ws resolve failed');
-
+      // サーバーは固定（tell.manh2309.org:35000）なので DNS 解決不要
       if (!opts?.silent) setStatus(`number: ${currentNumber}, connecting to ${nodeWsUrl} ...`);
       await openNodeWS(currentNumber, currentJWT);
       if (!opts?.silent) setStatus(`connected as ${currentNumber}, waiting for authentication...`);
@@ -1696,51 +1626,18 @@ export function buildUI(): void {
   btnCreate.onclick = async () => {
     try {
       const username = signupUsernameInput.value.trim();
-      const email = signupEmailInput.value.trim();
       const password = signupPasswordInput.value;
       const passwordConfirm = signupPasswordConfirmInput.value;
       if (!username) throw new Error('ユーザー名を入力してください');
-      if (!email) throw new Error('メールアドレスを入力してください');
       if (!password) throw new Error('パスワードを入力してください');
       if (password.length < 8) throw new Error('パスワードは8文字以上で入力してください');
       if (password !== passwordConfirm) throw new Error('パスワードが一致しません');
-      const number = await createAccount(windowBase, email, username, password);
+      const number = await createAccount(windowBase, username, password);
       setStatus(`account created: ${number}`);
       currentNumber = number;
       localStorage.setItem(LS_USERNAME, username);
       localStorage.setItem(LS_NUMBER, number);
       loginUsernameInput.value = username;
-      setActiveScreen('login');
-    } catch (err) {
-      setErrorStatus(err);
-    }
-  };
-
-  btnResetReq.onclick = async () => {
-    try {
-      await resetRequest(windowBase, resetEmailInput.value.trim());
-      setStatus('再設定メールを送信しました。トークンを入力してください。');
-      resetStep1.style.display = 'none';
-      resetStep2.style.display = 'block';
-      btnResetReq.style.display = 'none';
-      btnResetDo.style.display = '';
-      resetTokenInput.focus();
-    } catch (err) {
-      setErrorStatus(err);
-    }
-  };
-
-  btnResetDo.onclick = async () => {
-    try {
-      const password = resetPasswordInput.value;
-      const passwordConfirm = resetPasswordConfirmInput.value;
-      if (!password) throw new Error('新しいパスワードを入力してください');
-      if (password.length < 8) throw new Error('パスワードは8文字以上で入力してください');
-      if (password !== passwordConfirm) throw new Error('パスワードが一致しません');
-      const number = await resetDo(windowBase, resetTokenInput.value.trim(), password);
-      setStatus(`reset done: ${number}`);
-      currentNumber = number;
-      localStorage.setItem(LS_NUMBER, number);
       setActiveScreen('login');
     } catch (err) {
       setErrorStatus(err);
@@ -1777,7 +1674,7 @@ export function buildUI(): void {
       renderThreadList();
       persistThread();
 
-      await sendSMS(windowBase, to, from, body, timestamp);
+      await sendSMS(windowBase, to, from, body, timestamp, currentJWT);
       const target = chatItems.find((x) => x.id === pendingId);
       if (target) target.status = 'sent';
       renderChatItems();
@@ -1817,7 +1714,7 @@ export function buildUI(): void {
       const pc = await ensurePeerForTarget(to);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      await sendICEOffer(windowBase, { from, to, offer: pc.localDescription?.toJSON() ?? offer });
+      await sendICEOffer(windowBase, { from, to, offer: pc.localDescription?.toJSON() ?? offer }, currentJWT);
       setCallPhase('dialing', `${to} に発信中`);
       setStatus('call offer sent');
     } catch (err) {
@@ -1838,7 +1735,7 @@ export function buildUI(): void {
     setCallPhase('ended', 'こちらから終話');
     if (peer && from) {
       try {
-        await sendCallHangup(windowBase, { from, to: peer });
+        await sendCallHangup(windowBase, { from, to: peer }, currentJWT);
       } catch {
         // ignore network errors on hangup notice
       }
