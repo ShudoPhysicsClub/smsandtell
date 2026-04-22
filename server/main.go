@@ -5,8 +5,8 @@
 package main
 
 import (
-	crand "crypto/rand"
 	"crypto/hmac"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
@@ -171,6 +171,7 @@ func authFromRequest(r *http.Request) (string, error) {
 	if tok := r.Header.Get("X-Token"); tok != "" {
 		return verifyJWT(tok)
 	}
+	log.Printf("authFromRequest failed: no Bearer or X-Token header. Authorization header: %q", auth)
 	return "", fmt.Errorf("missing authorization")
 }
 
@@ -280,7 +281,6 @@ func sendToClient(to string, payload any) {
 		}
 	}
 }
-
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -489,30 +489,111 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	var authMsg struct {
-		Action string `json:"action"`
-		Number string `json:"number"`
-		Token  string `json:"token"`
-	}
-	if err := conn.ReadJSON(&authMsg); err != nil {
-		return
-	}
-	if authMsg.Action != "auth" || authMsg.Token == "" {
-		_ = conn.WriteJSON(map[string]string{"error": "expected auth action with token"})
+	// 最初のメッセージを読む（認証またはアカウント作成/ログイン）
+	var msg map[string]any
+	if err := conn.ReadJSON(&msg); err != nil {
 		return
 	}
 
-	claimedNumber, err := verifyJWT(authMsg.Token)
-	if err != nil {
-		_ = conn.WriteJSON(map[string]string{"error": "auth failed: " + err.Error()})
-		return
-	}
-	userID := strings.TrimSpace(claimedNumber)
-	if userID == "" {
-		_ = conn.WriteJSON(map[string]string{"error": "invalid user id"})
+	action, _ := msg["action"].(string)
+	requestID, _ := msg["request_id"].(string)
+	userID := ""
+
+	// 認証前のアクション処理
+	if action == "account/new" {
+		// アカウント作成
+		username, _ := msg["username"].(string)
+		password, _ := msg["password"].(string)
+		if username == "" || password == "" {
+			_ = conn.WriteJSON(map[string]string{"error": "username and password are required"})
+			return
+		}
+
+		// パスワードハッシュ化
+		hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		if err != nil {
+			_ = conn.WriteJSON(map[string]string{"error": "password hash failed"})
+			return
+		}
+
+		// ユーザー番号生成
+		number, err := generateUserNumber()
+		if err != nil {
+			_ = conn.WriteJSON(map[string]string{"error": "failed to generate number"})
+			return
+		}
+
+		// ユーザー登録
+		if _, err := db.Exec(
+			"INSERT INTO users (username, number, password_hash, created_at) VALUES (?, ?, ?, ?)",
+			username, number, string(hash), time.Now().UTC().Unix(),
+		); err != nil {
+			_ = conn.WriteJSON(map[string]string{"error": "username already exists"})
+			return
+		}
+
+		token, err := issueJWT(number)
+		if err != nil {
+			_ = conn.WriteJSON(map[string]string{"error": "token issue failed"})
+			return
+		}
+
+		_ = conn.WriteJSON(map[string]any{"request_id": requestID, "token": token, "number": number})
+		userID = number
+	} else if action == "account/login" {
+		// ログイン
+		username, _ := msg["username"].(string)
+		password, _ := msg["password"].(string)
+		if username == "" || password == "" {
+			_ = conn.WriteJSON(map[string]string{"error": "username and password are required"})
+			return
+		}
+
+		var number, passwordHash string
+		err := db.QueryRow("SELECT number, password_hash FROM users WHERE username = ?", username).Scan(&number, &passwordHash)
+		if err != nil {
+			_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$invalidhashfortimingnormalization"), []byte(password))
+			_ = conn.WriteJSON(map[string]string{"error": "invalid username or password"})
+			return
+		}
+
+		if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(password)); err != nil {
+			_ = conn.WriteJSON(map[string]string{"error": "invalid username or password"})
+			return
+		}
+
+		token, err := issueJWT(number)
+		if err != nil {
+			_ = conn.WriteJSON(map[string]string{"error": "token issue failed"})
+			return
+		}
+
+		_ = conn.WriteJSON(map[string]any{"request_id": requestID, "token": token, "number": number})
+		userID = number
+	} else if action == "auth" {
+		// WebSocket 認証
+		token, _ := msg["token"].(string)
+		if token == "" {
+			_ = conn.WriteJSON(map[string]string{"error": "token is required"})
+			return
+		}
+
+		claimedNumber, err := verifyJWT(token)
+		if err != nil {
+			_ = conn.WriteJSON(map[string]string{"error": "auth failed: " + err.Error()})
+			return
+		}
+		userID = strings.TrimSpace(claimedNumber)
+		if userID == "" {
+			_ = conn.WriteJSON(map[string]string{"error": "invalid user id"})
+			return
+		}
+	} else {
+		_ = conn.WriteJSON(map[string]string{"error": "first message must be account/new, account/login, or auth"})
 		return
 	}
 
+	// クライアント登録
 	client := &ClientConn{conn: conn, number: userID}
 	clientsMu.Lock()
 	clients[userID] = client
@@ -528,10 +609,12 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 		log.Printf("client disconnected: %s", userID)
 	}()
 
+	// 認証ステータス送信
 	if err := client.send(map[string]string{"status": "authenticated"}); err != nil {
 		return
 	}
 
+	// 保留メッセージを送信
 	messages, err := popMessages(userID)
 	if err != nil {
 		log.Printf("popMessages error for %s: %v", userID, err)
@@ -541,9 +624,94 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// メッセージ処理ループ
 	for {
-		if _, _, err := conn.ReadMessage(); err != nil {
+		var incomingMsg map[string]any
+		if err := conn.ReadJSON(&incomingMsg); err != nil {
 			return
+		}
+
+		actionType, _ := incomingMsg["action"].(string)
+		reqID, _ := incomingMsg["request_id"].(string)
+
+		switch actionType {
+		case "sms/send":
+			// SMS 送信
+			to, _ := incomingMsg["to"].(string)
+			to = strings.TrimSpace(to)
+			if to == "" {
+				_ = client.send(map[string]any{"request_id": reqID, "error": "to is required"})
+				continue
+			}
+
+			msgBody, _ := incomingMsg["message"].(map[string]any)
+			msgJSON, _ := json.Marshal(msgBody)
+
+			tsVal, _ := incomingMsg["timestamp"].(float64)
+			ts := int64(tsVal)
+			if ts == 0 {
+				ts = time.Now().UTC().Unix()
+			}
+
+			smsMsg := &Message{
+				From:      userID,
+				To:        to,
+				Message:   json.RawMessage(msgJSON),
+				Timestamp: ts,
+			}
+
+			if err := deliverOrStore(smsMsg); err != nil {
+				log.Printf("deliverOrStore failed from=%s to=%s: %v", userID, to, err)
+				_ = client.send(map[string]any{"request_id": reqID, "error": "failed to send message"})
+			} else {
+				_ = client.send(map[string]any{"request_id": reqID, "status": "message sent"})
+			}
+
+		case "ice/offer", "ice/answer", "ice/candidate":
+			// ICE シグナリング
+			to, _ := incomingMsg["to"].(string)
+			to = strings.TrimSpace(to)
+			if to == "" {
+				_ = client.send(map[string]any{"request_id": reqID, "error": "to is required"})
+				continue
+			}
+
+			payload := map[string]any{
+				"action": actionType,
+				"data": map[string]any{
+					"from":      userID,
+					"to":        to,
+					"offer":     incomingMsg["offer"],
+					"answer":    incomingMsg["answer"],
+					"candidate": incomingMsg["candidate"],
+				},
+			}
+			sendToClient(to, payload)
+			_ = client.send(map[string]any{"request_id": reqID, "status": "ok"})
+
+		case "call/auth-ok", "call/reject", "call/hangup":
+			// 通話制御
+			to, _ := incomingMsg["to"].(string)
+			to = strings.TrimSpace(to)
+			if to == "" {
+				_ = client.send(map[string]any{"request_id": reqID, "error": "to is required"})
+				continue
+			}
+
+			payload := map[string]any{
+				"action": actionType,
+				"data": map[string]any{
+					"from":   userID,
+					"to":     to,
+					"reason": incomingMsg["reason"],
+				},
+			}
+			sendToClient(to, payload)
+			_ = client.send(map[string]any{"request_id": reqID, "status": "ok"})
+
+		default:
+			log.Printf("unknown action from %s: %s", userID, actionType)
+			_ = client.send(map[string]any{"request_id": reqID, "error": "unknown action"})
 		}
 	}
 }

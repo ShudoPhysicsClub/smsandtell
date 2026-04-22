@@ -1,6 +1,44 @@
-// 固定サーバーアドレス（DNS解決不要）
-export const SERVER_BASE = 'https://tell.manh2309.org:35000';
-export const SERVER_WS   = 'wss://tell.manh2309.org:35000/ws';
+// WebSocket を使用したサーバー通信（HTTP POST 廃止）
+export const SERVER_BASE = 'https://mail.shudo-physics.com:35000';
+export const SERVER_WS   = 'wss://mail.shudo-physics.com:35000/ws';
+
+// グローバル WebSocket 接続
+let wsConnection: WebSocket | null = null;
+const pendingRequests = new Map<string, { resolve: (v: any) => void; reject: (e: Error) => void; timeout: number }>();
+let wsInboundHandler: ((msg: Record<string, any>) => void) | null = null;
+
+export function setWSInboundHandler(handler: ((msg: Record<string, any>) => void) | null): void {
+  wsInboundHandler = handler;
+}
+
+function settlePendingByRequestId(requestId: string, msg: Record<string, any>): boolean {
+  if (!requestId || !pendingRequests.has(requestId)) return false;
+  const pending = pendingRequests.get(requestId)!;
+  clearTimeout(pending.timeout);
+  pendingRequests.delete(requestId);
+  if (msg.error) {
+    pending.reject(new Error(String(msg.error)));
+  } else {
+    pending.resolve(msg);
+  }
+  return true;
+}
+
+function settleOldestPending(msg: Record<string, any>): boolean {
+  const first = pendingRequests.entries().next().value as
+    | [string, { resolve: (v: any) => void; reject: (e: Error) => void; timeout: number }]
+    | undefined;
+  if (!first) return false;
+  const [rid, pending] = first;
+  clearTimeout(pending.timeout);
+  pendingRequests.delete(rid);
+  if (msg.error) {
+    pending.reject(new Error(String(msg.error)));
+  } else {
+    pending.resolve(msg);
+  }
+  return true;
+}
 
 function createRequestId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -9,28 +47,70 @@ function createRequestId(): string {
   return `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-async function postJSON(url: string, body: unknown, token?: string): Promise<any> {
-  const requestId = createRequestId();
-  const payload =
-    body && typeof body === 'object' && !Array.isArray(body)
-      ? ({ request_id: requestId, ...(body as Record<string, unknown>) } as Record<string, unknown>)
-      : body;
-  const headers: Record<string, string> = {
-    'content-type': 'application/json',
-    'x-request-id': requestId,
-  };
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-  const res = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
+/**
+ * WebSocket 接続を確立する
+ */
+function ensureWSConnection(): Promise<WebSocket> {
+  return new Promise((resolve, reject) => {
+    if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
+      resolve(wsConnection);
+      return;
+    }
+
+    const ws = new WebSocket(SERVER_WS);
+    ws.onopen = () => {
+      wsConnection = ws;
+      resolve(ws);
+    };
+    ws.onerror = () => {
+      reject(new Error('WebSocket connection failed'));
+    };
+    ws.onmessage = (event) => {
+      let msg: Record<string, any>;
+      try {
+        msg = JSON.parse(String(event.data)) as Record<string, any>;
+      } catch {
+        return;
+      }
+
+      const requestId = String(msg.request_id ?? '');
+      if (settlePendingByRequestId(requestId, msg)) return;
+
+      // 互換対応: request_id を返さない旧サーバー応答でも先頭保留を解決する
+      const looksLikeDirectResponse =
+        (typeof msg.token === 'string' && typeof msg.number === 'string') ||
+        typeof msg.error === 'string' ||
+        typeof msg.status === 'string';
+      if (looksLikeDirectResponse) {
+        if (settleOldestPending(msg)) return;
+      }
+
+      wsInboundHandler?.(msg);
+    };
+    ws.onclose = () => {
+      wsConnection = null;
+    };
   });
-  if (!res.ok) {
-    throw new Error(await res.text());
-  }
-  return res.json();
+}
+
+/**
+ * WebSocket でリクエストを送信して レスポンスを待つ
+ */
+async function sendWSRequest(action: string, payload: Record<string, any>): Promise<any> {
+  const ws = await ensureWSConnection();
+  const requestId = createRequestId();
+  
+  const message = { request_id: requestId, action, ...payload };
+  
+  return new Promise<any>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      pendingRequests.delete(requestId);
+      reject(new Error(`Request timeout for ${action}`));
+    }, 30000);
+
+    pendingRequests.set(requestId, { resolve, reject, timeout });
+    ws.send(JSON.stringify(message));
+  });
 }
 
 // ---- アカウント ----
@@ -40,8 +120,13 @@ export async function createAccount(
   username: string,
   password: string,
 ): Promise<string> {
-  const data = (await postJSON(`${windowBase}/account/new`, { username, password })) as { number: string };
-  return data.number;
+  console.log('[API WebSocket] Creating account:', { username });
+  const response = await sendWSRequest('account/new', { username, password });
+  if (response.error) {
+    throw new Error(response.error);
+  }
+  console.log('[API WebSocket] Account created:', response.number);
+  return response.number;
 }
 
 export async function loginAccount(
@@ -49,10 +134,13 @@ export async function loginAccount(
   username: string,
   password: string,
 ): Promise<{ token: string; number: string }> {
-  return (await postJSON(`${windowBase}/account/login`, { username, password })) as {
-    token: string;
-    number: string;
-  };
+  console.log('[API WebSocket] Logging in:', { username });
+  const response = await sendWSRequest('account/login', { username, password });
+  if (response.error) {
+    throw new Error(response.error);
+  }
+  console.log('[API WebSocket] Login successful:', response.number);
+  return { token: response.token, number: response.number };
 }
 
 // ---- SMS ----
@@ -65,21 +153,33 @@ export async function sendSMS(
   timestamp: number,
   token: string,
 ): Promise<void> {
-  await postJSON(
-    `${windowBase}/sms/send`,
-    { to, from, message: { body: messageBody }, timestamp },
-    token,
-  );
+  console.log('[API WebSocket] Sending SMS:', { to, from, timestamp });
+  const response = await sendWSRequest('sms/send', {
+    to,
+    message: { body: messageBody },
+    timestamp,
+  });
+  if (response.error) {
+    throw new Error(response.error);
+  }
+  console.log('[API WebSocket] SMS sent to:', to);
 }
 
-// ---- ICE シグナリング（JWT 必須）----
+// ---- ICE シグナリング ----
 
 export async function sendICEOffer(
   windowBase: string,
   payload: { from: string; to: string; offer: unknown },
   token: string,
 ): Promise<void> {
-  await postJSON(`${windowBase}/ice/offer`, payload, token);
+  console.log('[API WebSocket] Sending ICE offer to:', payload.to);
+  const response = await sendWSRequest('ice/offer', {
+    to: payload.to,
+    offer: payload.offer,
+  });
+  if (response.error) {
+    throw new Error(response.error);
+  }
 }
 
 export async function sendICEAnswer(
@@ -87,7 +187,14 @@ export async function sendICEAnswer(
   payload: { from: string; to: string; answer: unknown },
   token: string,
 ): Promise<void> {
-  await postJSON(`${windowBase}/ice/answer`, payload, token);
+  console.log('[API WebSocket] Sending ICE answer to:', payload.to);
+  const response = await sendWSRequest('ice/answer', {
+    to: payload.to,
+    answer: payload.answer,
+  });
+  if (response.error) {
+    throw new Error(response.error);
+  }
 }
 
 export async function sendICECandidate(
@@ -95,17 +202,30 @@ export async function sendICECandidate(
   payload: { from: string; to: string; candidate: unknown },
   token: string,
 ): Promise<void> {
-  await postJSON(`${windowBase}/ice/candidate`, payload, token);
+  console.log('[API WebSocket] Sending ICE candidate to:', payload.to);
+  const response = await sendWSRequest('ice/candidate', {
+    to: payload.to,
+    candidate: payload.candidate,
+  });
+  if (response.error) {
+    throw new Error(response.error);
+  }
 }
 
-// ---- 通話シグナリング（JWT 必須）----
+// ---- 通話シグナリング ----
 
 export async function sendCallAuthOK(
   windowBase: string,
   payload: { from: string; to: string },
   token: string,
 ): Promise<void> {
-  await postJSON(`${windowBase}/call/auth-ok`, payload, token);
+  console.log('[API WebSocket] Sending call auth-ok to:', payload.to);
+  const response = await sendWSRequest('call/auth-ok', {
+    to: payload.to,
+  });
+  if (response.error) {
+    throw new Error(response.error);
+  }
 }
 
 export async function sendCallReject(
@@ -113,7 +233,14 @@ export async function sendCallReject(
   payload: { from: string; to: string; reason: string },
   token: string,
 ): Promise<void> {
-  await postJSON(`${windowBase}/call/reject`, payload, token);
+  console.log('[API WebSocket] Rejecting call from:', payload.to);
+  const response = await sendWSRequest('call/reject', {
+    to: payload.to,
+    reason: payload.reason,
+  });
+  if (response.error) {
+    throw new Error(response.error);
+  }
 }
 
 export async function sendCallHangup(
@@ -121,5 +248,46 @@ export async function sendCallHangup(
   payload: { from: string; to: string },
   token: string,
 ): Promise<void> {
-  await postJSON(`${windowBase}/call/hangup`, payload, token);
+  console.log('[API WebSocket] Hanging up call with:', payload.to);
+  const response = await sendWSRequest('call/hangup', {
+    to: payload.to,
+  });
+  if (response.error) {
+    throw new Error(response.error);
+  }
+}
+
+/**
+ * WebSocket 接続をクローズ（ログアウト時に呼び出し）
+ */
+export function closeWSConnection(): void {
+  if (wsConnection) {
+    wsConnection.close();
+    wsConnection = null;
+  }
+}
+
+/**
+ * 認証後の WebSocket をセットアップ（メッセージ受信用）
+ */
+export async function setupAuthenticatedWS(wsUrl: string, number: string, token: string): Promise<WebSocket> {
+  const ws = new WebSocket(wsUrl);
+  
+  return new Promise((resolve, reject) => {
+    ws.onopen = () => {
+      // 認証メッセージを送信
+      ws.send(JSON.stringify({ action: 'auth', number, token, request_id: createRequestId() }));
+    };
+    ws.onerror = () => {
+      reject(new Error('WebSocket connection failed'));
+    };
+    ws.onmessage = (event) => {
+      const msg = JSON.parse(String(event.data)) as Record<string, any>;
+      
+      if (msg.status === 'authenticated') {
+        wsConnection = ws;
+        resolve(ws);
+      }
+    };
+  });
 }

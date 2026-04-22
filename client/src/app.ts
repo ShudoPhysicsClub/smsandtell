@@ -4,10 +4,11 @@ import {
   createSection,
   styleInputBase,
   toErrorText,
-} from './dom';
+} from './dom.js';
 import {
   SERVER_BASE,
   SERVER_WS,
+  closeWSConnection,
   createAccount,
   loginAccount,
   sendCallAuthOK,
@@ -15,8 +16,9 @@ import {
   sendICEAnswer,
   sendICECandidate,
   sendICEOffer,
+  setWSInboundHandler,
   sendSMS,
-} from './api';
+} from './api.js';
 import type { NodeInbound, ScreenKey } from './types';
 
 let windowBase = SERVER_BASE;
@@ -34,6 +36,7 @@ let signalInboxNode: HTMLPreElement | null = null;
 let toastHostNode: HTMLDivElement | null = null;
 let messageFeedNode: HTMLDivElement | null = null;
 let threadListNode: HTMLDivElement | null = null;
+let selfNumberBadgeNode: HTMLDivElement | null = null;
 let setActiveScreenRef: ((key: ScreenKey) => void) | null = null;
 let syncAuthUIRef: (() => void) | null = null;
 let syncMessageFeedRef: ((messages: unknown[]) => void) | null = null;
@@ -208,6 +211,11 @@ function setErrorStatus(err: unknown): void {
 function refreshAuthState(): void {
   if (syncAuthUIRef) syncAuthUIRef();
   if (syncCallUIRef) syncCallUIRef(callPhase);
+  if (selfNumberBadgeNode) {
+    const show = isAuthenticated && currentNumber.trim() !== '';
+    selfNumberBadgeNode.style.display = show ? 'inline-flex' : 'none';
+    selfNumberBadgeNode.textContent = show ? `自分の番号: ${currentNumber}` : '';
+  }
 }
 
 function setCallPhase(phase: CallPhase, note?: string): void {
@@ -238,6 +246,8 @@ function closeNodeWS(): void {
     nodeSocket.close();
     nodeSocket = null;
   }
+  setWSInboundHandler(null);
+  closeWSConnection();
   isAuthenticated = false;
   currentJWT = '';
   pendingAuthResolver = null;
@@ -251,7 +261,10 @@ function closeNodeWS(): void {
 
 function openNodeWS(number: string, jwt: string): Promise<void> {
   return new Promise((resolve, reject) => {
+    // WebSocketクリーンアップ時に JWT を保持する
+    const savedJWT = currentJWT;
     closeNodeWS();
+    currentJWT = jwt;  // closeNodeWS で消されたので復元
 
     if (!nodeWsUrl) {
       reject(new Error('node ws url is empty'));
@@ -1219,8 +1232,10 @@ export function buildUI(): void {
     callNoteNode.textContent = note ?? '';
     btnStartCall.disabled = !isAuthenticated || (phase !== 'idle' && phase !== 'ended');
     btnHangup.disabled = phase === 'idle' || phase === 'ended';
-    btnMute.disabled = phase !== 'in_call';
-    callHost.style.display = phase === 'idle' || phase === 'ended' ? 'none' : '';
+    // 発信中(dialing)でもマイクを先に切れるようにする
+    btnMute.disabled = !isAuthenticated || phase === 'idle' || phase === 'ended';
+    // 発信前でも操作できるように、ログイン済みなら常に表示する
+    callHost.style.display = isAuthenticated ? '' : 'none';
     if (remoteAudioNode) {
       remoteAudioNode.style.display = phase === 'in_call' ? '' : 'none';
     }
@@ -1498,6 +1513,35 @@ export function buildUI(): void {
     }
   };
 
+  setWSInboundHandler((data: Record<string, unknown>) => {
+    const action = String(data.action ?? '');
+
+    if (action === 'messages') {
+      if (syncMessageFeedRef) {
+        syncMessageFeedRef((data.messages as unknown[]) ?? []);
+      }
+      setStatus('messages received');
+      return;
+    }
+
+    const normalizedAction = action.replaceAll('/', '_').replaceAll('-', '_');
+    if (
+      normalizedAction === 'ice_offer' ||
+      normalizedAction === 'ice_answer' ||
+      normalizedAction === 'ice_candidate' ||
+      normalizedAction === 'call_auth_ok' ||
+      normalizedAction === 'call_reject' ||
+      normalizedAction === 'call_hangup'
+    ) {
+      handleSignalAction(normalizedAction, data.data).catch((err: unknown) => setErrorStatus(err));
+      return;
+    }
+
+    if (data.error) {
+      setErrorStatus(`node error: ${String(data.error)}`);
+    }
+  });
+
   remoteAudioNode = document.createElement('audio');
   remoteAudioNode.autoplay = true;
   remoteAudioNode.controls = true;
@@ -1558,11 +1602,28 @@ export function buildUI(): void {
     closeNodeWS();
     setStatus('disconnected');
   };
+
+  selfNumberBadgeNode = document.createElement('div');
+  selfNumberBadgeNode.style.position = 'fixed';
+  selfNumberBadgeNode.style.left = '14px';
+  selfNumberBadgeNode.style.bottom = '14px';
+  selfNumberBadgeNode.style.padding = '8px 12px';
+  selfNumberBadgeNode.style.borderRadius = '999px';
+  selfNumberBadgeNode.style.background = 'rgba(17, 24, 39, 0.78)';
+  selfNumberBadgeNode.style.color = '#ffffff';
+  selfNumberBadgeNode.style.fontSize = '12px';
+  selfNumberBadgeNode.style.fontWeight = '700';
+  selfNumberBadgeNode.style.backdropFilter = 'blur(8px)';
+  selfNumberBadgeNode.style.zIndex = '9998';
+  selfNumberBadgeNode.style.display = 'none';
+
   container.appendChild(disconnectXButton);
   container.appendChild(screenHost);
 
   root.appendChild(container);
+  root.appendChild(selfNumberBadgeNode);
   syncAuthUI();
+  refreshAuthState();
   setActiveScreen('login');
 
   let isLoggingIn = false;
@@ -1576,21 +1637,18 @@ export function buildUI(): void {
       if (!password) throw new Error('パスワードを入力してください');
 
       if (!opts?.silent) setStatus('ログイン中...');
+      
+      // WebSocket ベースのログイン
       const loginResult = await loginAccount(windowBase, username, password);
-
       currentNumber = loginResult.number;
       currentJWT = loginResult.token;
 
       localStorage.setItem(LS_USERNAME, username);
       localStorage.setItem(LS_NUMBER, currentNumber);
 
-      // サーバーは固定（tell.manh2309.org:35000）なので DNS 解決不要
-      if (!opts?.silent) setStatus(`number: ${currentNumber}, connecting to ${nodeWsUrl} ...`);
-      await openNodeWS(currentNumber, currentJWT);
-      if (!opts?.silent) setStatus(`connected as ${currentNumber}, waiting for authentication...`);
+      if (!opts?.silent) setStatus(`ログイン成功: ${currentNumber}`);
 
-      await waitAuthenticated();
-      setCallPhase('idle');
+      // チャット画面に遷移
       await loadChatHistory();
       if (!activeThreadNumber && chatItems.length > 0) {
         const latest = chatItems[chatItems.length - 1];
@@ -1604,8 +1662,12 @@ export function buildUI(): void {
       renderThreadList();
       chatPeerLabel.textContent = getDisplayName(smsToInput.value.trim());
 
-      if (!opts?.silent) setStatus(`ログイン成功: ${currentNumber}`);
+      isAuthenticated = true;
+      setCallPhase('idle');
+      refreshAuthState();
       setActiveScreen('chat');
+    } catch (err) {
+      setErrorStatus(err);
     } finally {
       isLoggingIn = false;
     }
@@ -1674,6 +1736,7 @@ export function buildUI(): void {
       renderThreadList();
       persistThread();
 
+      console.log('Sending SMS with token:', currentJWT ? `token exists (length: ${currentJWT.length})` : 'NO TOKEN');
       await sendSMS(windowBase, to, from, body, timestamp, currentJWT);
       const target = chatItems.find((x) => x.id === pendingId);
       if (target) target.status = 'sent';
@@ -1725,11 +1788,18 @@ export function buildUI(): void {
     void startCallFlow();
   };
   btnHeaderCall.onclick = () => {
-    void startCallFlow();
+    if (!isAuthenticated) {
+      setStatus('ログイン後に通話機能が使える');
+      return;
+    }
+    // 通話ヘッダーボタンは「電話操作パネルを開く」挙動にする
+    callHost.style.display = '';
+    if (syncCallUIRef) syncCallUIRef(callPhase);
+    callToInput.focus();
   };
 
   btnHangup.onclick = async () => {
-    const peer = activeCallPeer;
+    const peer = activeCallPeer || callToInput.value.trim() || smsToInput.value.trim();
     const from = currentNumber;
     cleanupCall();
     setCallPhase('ended', 'こちらから終話');
