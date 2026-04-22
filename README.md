@@ -1,100 +1,70 @@
 # smsandtell
 
-smsと電話を再現します。
+SMSと電話を再現するアプリです。
 
-## 起動順（必須）
+## アーキテクチャ
 
-1. dbサービスを起動
-2. nodeサービスを起動
-3. windowサービスを起動
+すべての機能を `server/` の単一サーバーに統合しています。
 
-### Windows一括起動テンプレ
+- **サーバー**: `server/main.go`（Go、SQLite、ポート 35000）
+- **クライアント**: `client/`（TypeScript、`tell.manh2309.org:35000` に固定接続）
 
-```powershell
-./start-all.ps1
+## 起動方法
+
+### サーバー
+
+```bash
+cd server
+go build -o server .
+JWT_SECRET=your_secret PORT=35000 CERT_FILE=... KEY_FILE=... ./server
 ```
 
-## client本番ビルド
+環境変数の設定例は `server/.env.example` を参照。
 
-```powershell
+### クライアントビルド
+
+```bash
 cd client
 npm install
-npm run build:prod
+npm run build
 ```
 
-- 生成物: `client/dist/main.js`
-- 配信時は `client/index.html` と `client/dist/main.js` を同じ公開ディレクトリに置く
+生成物: `client/dist/main.js` + `client/index.html`
+
+これらを `server/static/` ディレクトリ（`STATIC_DIR` 環境変数で変更可）にコピーすると、サーバーが静的ファイルを配信します。
 
 ## 環境変数
 
-- db: `db/.env`
-- node: `node/.env`
-- window: `window/.env`
+| 変数 | 説明 | デフォルト |
+|------|------|----------|
+| `PORT` | リッスンポート | `35000` |
+| `JWT_SECRET` | JWT署名シークレット（**必須**） | - |
+| `CERT_FILE` | TLS証明書ファイルパス | 未設定時は平文HTTP |
+| `KEY_FILE` | TLS秘密鍵ファイルパス | 未設定時は平文HTTP |
+| `DB_PATH` | SQLiteファイルパス | `smsandtell.db` |
+| `STATIC_DIR` | 静的ファイルディレクトリ | `./static` |
 
-特に以下は必須です。
+## API エンドポイント
 
-- `DB_SERVICE_URL`（node/window）
-- `DB_SERVICE_TOKEN`（db/node/windowで同じ値）
-- `WINDOW_API_BASE`（nodeが公開鍵を取得する先）
-- `TOKEN_TTL_MINUTES`（window。未指定時は15分）
-- `NUMBER`（window。自拠点番号）
-- DNSシードドメインは `manh2309.org` 固定
-
-## 疎通確認
-
-1. db health
-
-```powershell
-Invoke-WebRequest http://DB_SERVER_HOST:32000/health
-```
-
-1. windowの公開鍵API
-
-```powershell
-Invoke-WebRequest https://WINDOW_SERVER_HOST:30000/pubkey/01-xxxxxx
-```
-
-1. nodeの受信確認
-
-- クライアントをnodeにWS接続
-- ログイン時に保留メッセージが返ってきたら成功
+| エンドポイント | 説明 |
+|-------------|------|
+| `POST /account/new` | 新規登録（username + password） |
+| `POST /account/login` | ログイン → JWT + number 返却 |
+| `POST /sms/send` | SMS送信（JWT必須） |
+| `POST /ice/offer` | ICE offer中継（JWT必須） |
+| `POST /ice/answer` | ICE answer中継（JWT必須） |
+| `POST /ice/candidate` | ICE candidate中継（JWT必須） |
+| `POST /call/auth-ok` | 通話認証OK（JWT必須） |
+| `POST /call/reject` | 通話拒否（JWT必須） |
+| `POST /call/hangup` | 通話終了（JWT必須） |
+| `GET /ws` | WebSocket接続（JWT認証後メッセージ受信） |
 
 ## 仕様メモ
 
-- メッセージはdbで3日保持し、1時間ごとにUTC基準で削除
-- db内部通信はWS（`/ws`）
-- 公開鍵取得の入口はwindow経由
-- ログイン時のnode接続先は、`02-xxxxxx` のような番号の接頭辞（`02`）を使って `02.manh2309.org` のTXTを引き、ランダム選択
-- email確認/再設定トークンはwindowメモリにTTL付きで保持し、1分ごとに期限切れ掃除
-
-### DNSシード例
-
-`01.manh2309.org` のTXTに `window=` と `node=` を並べる。
-
-```txt
-window=win-a.example.com:3334 window=win-b.example.com:3334 node=node-a.example.com:334 node=node-b.example.com:334
-```
-
-clientは `window=` を `https://<addr>`、`node=` を `wss://<addr>/ws` に正規化して接続する。
-
-## 署名仕様（固定）
-
-- 署名アルゴリズム: ECSH P-256（`node/ecsh.go`）
-- 署名値エンコード: hex（96byte = 192 hex chars）
-- 公開鍵エンコード: hex（64byte = 128 hex chars）
-
-### ログイン認証署名
-
-署名対象JSON（canonical JSON）:
-
-```json
-{"number":"<number>","challenge":"<challenge>"}
-```
-
-### メッセージ署名
-
-署名対象JSON（canonical JSON）:
-
-```json
-{"timestamp":<unix> ,"message":<json>,"to":"<to>","from":"<from>"}
-```
+- 登録はユーザー名とパスワードのみ（メール不要）
+- ユーザー名は重複不可（`username already taken` を返す）
+- DBにはユーザー名・番号・パスワードハッシュを保存（SQLite）
+- メッセージはDBで3日保持し、1時間ごとに削除
+- WebSocket接続時にJWT認証 → 保留メッセージを即配信
+- オフライン時はDBに保存 → 次回接続時に配信
+- クライアントは `tell.manh2309.org:35000` に固定接続（DNS解決不要）

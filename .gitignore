@@ -4,6 +4,7 @@
 /window/window
 /window/node
 /db/db
+/server/server
 
 # Node.js
 node_modules/
