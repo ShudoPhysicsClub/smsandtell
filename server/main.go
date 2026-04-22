@@ -1,6 +1,6 @@
 // server/main.go - 統合サーバー（window + node + db を一つにまとめたもの）
 // ポート: 35000 (TLS)
-// DB: SQLite (modernc.org/sqlite, CGO不要)
+// DB: MariaDB
 // 登録: ユーザー名 + パスワードのみ（メール不要）
 package main
 
@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,64 +22,90 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/bcrypt"
-	_ "modernc.org/sqlite"
 )
-
-// ---------------------------------------------------------------------------
-// グローバル変数
-// ---------------------------------------------------------------------------
 
 var (
 	db        *sql.DB
 	jwtSecret []byte
-	upgrader  = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
-	}
+	upgrader  = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	clients   = make(map[string]*ClientConn)
+	clientsMu sync.RWMutex
 )
 
 const jwtTokenExpiry = 24 * time.Hour
 
-// ---------------------------------------------------------------------------
-// DB 初期化
-// ---------------------------------------------------------------------------
+func buildMySQLDSN() (string, error) {
+	if dsn := os.Getenv("DB_DSN"); dsn != "" {
+		return dsn, nil
+	}
+
+	user := os.Getenv("DB_USER")
+	if user == "" {
+		return "", fmt.Errorf("DB_USER is required")
+	}
+	name := os.Getenv("DB_NAME")
+	if name == "" {
+		return "", fmt.Errorf("DB_NAME is required")
+	}
+
+	host := os.Getenv("DB_HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := os.Getenv("DB_PORT")
+	if port == "" {
+		port = "3306"
+	}
+
+	cfg := mysql.NewConfig()
+	cfg.User = user
+	cfg.Passwd = os.Getenv("DB_PASSWORD")
+	cfg.Net = "tcp"
+	cfg.Addr = net.JoinHostPort(host, port)
+	cfg.DBName = name
+	cfg.ParseTime = true
+	cfg.Loc = time.Local
+	cfg.Params = map[string]string{"charset": "utf8mb4"}
+	return cfg.FormatDSN(), nil
+}
 
 func initDB() error {
-	dbPath := os.Getenv("DB_PATH")
-	if dbPath == "" {
-		dbPath = "smsandtell.db"
+	dsn, err := buildMySQLDSN()
+	if err != nil {
+		return err
 	}
-	var err error
-	db, err = sql.Open("sqlite", dbPath)
+
+	db, err = sql.Open("mysql", dsn)
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
-	// SQLite は同時書き込み 1 本が基本。WAL モードで読み取りは並行可能にする。
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(10)
+
 	if err := db.Ping(); err != nil {
 		return fmt.Errorf("ping db: %w", err)
 	}
+
 	stmts := []string{
-		`PRAGMA journal_mode=WAL`,
-		`PRAGMA foreign_keys=ON`,
 		`CREATE TABLE IF NOT EXISTS users (
-			username      TEXT PRIMARY KEY,
-			number        TEXT UNIQUE NOT NULL,
-			password_hash TEXT NOT NULL,
-			created_at    INTEGER DEFAULT (unixepoch())
-		)`,
+			username      VARCHAR(64) PRIMARY KEY,
+			number        VARCHAR(32) NOT NULL UNIQUE,
+			password_hash VARCHAR(255) NOT NULL,
+			created_at    BIGINT NOT NULL
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS messages (
-			id          INTEGER PRIMARY KEY AUTOINCREMENT,
-			timestamp   INTEGER NOT NULL,
-			received_at INTEGER DEFAULT (unixepoch()),
-			message     TEXT NOT NULL,
-			to_user     TEXT NOT NULL,
-			from_user   TEXT NOT NULL
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_msg_to   ON messages(to_user)`,
-		`CREATE INDEX IF NOT EXISTS idx_msg_recv ON messages(received_at)`,
+			id          BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+			timestamp   BIGINT NOT NULL,
+			received_at BIGINT NOT NULL,
+			message     LONGTEXT NOT NULL,
+			to_user     VARCHAR(32) NOT NULL,
+			from_user   VARCHAR(32) NOT NULL,
+			INDEX idx_msg_to (to_user),
+			INDEX idx_msg_recv (received_at)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -87,10 +114,6 @@ func initDB() error {
 	}
 	return nil
 }
-
-// ---------------------------------------------------------------------------
-// JWT（HS256、標準ライブラリのみ）
-// ---------------------------------------------------------------------------
 
 func base64URLEncode(b []byte) string {
 	return base64.RawURLEncoding.EncodeToString(b)
@@ -140,7 +163,6 @@ func verifyJWT(token string) (string, error) {
 	return claims.Sub, nil
 }
 
-// authFromRequest は Authorization: Bearer <token> ヘッダーまたは X-Token ヘッダーから JWT を取得・検証する。
 func authFromRequest(r *http.Request) (string, error) {
 	auth := r.Header.Get("Authorization")
 	if strings.HasPrefix(auth, "Bearer ") {
@@ -151,10 +173,6 @@ func authFromRequest(r *http.Request) (string, error) {
 	}
 	return "", fmt.Errorf("missing authorization")
 }
-
-// ---------------------------------------------------------------------------
-// ユーザー管理
-// ---------------------------------------------------------------------------
 
 func generateUserNumber() (string, error) {
 	for i := 0; i < 200; i++ {
@@ -174,11 +192,6 @@ func generateUserNumber() (string, error) {
 	return "", fmt.Errorf("failed to generate unique number after 200 attempts")
 }
 
-// ---------------------------------------------------------------------------
-// メッセージ
-// ---------------------------------------------------------------------------
-
-// Message はユーザー間のメッセージ構造体。
 type Message struct {
 	ID        int64           `json:"id,omitempty"`
 	Timestamp int64           `json:"timestamp"`
@@ -189,13 +202,12 @@ type Message struct {
 
 func storeMessage(msg *Message) error {
 	_, err := db.Exec(
-		"INSERT INTO messages (timestamp, message, to_user, from_user) VALUES (?, ?, ?, ?)",
-		msg.Timestamp, string(msg.Message), msg.To, msg.From,
+		"INSERT INTO messages (timestamp, received_at, message, to_user, from_user) VALUES (?, ?, ?, ?, ?)",
+		msg.Timestamp, time.Now().UTC().Unix(), string(msg.Message), msg.To, msg.From,
 	)
 	return err
 }
 
-// popMessages は to_user 宛のメッセージを取得して DB から削除する（アトミック）。
 func popMessages(userID string) ([]Message, error) {
 	tx, err := db.Begin()
 	if err != nil {
@@ -203,10 +215,7 @@ func popMessages(userID string) ([]Message, error) {
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	rows, err := tx.Query(
-		"SELECT id, timestamp, message, to_user, from_user FROM messages WHERE to_user = ? ORDER BY timestamp ASC",
-		userID,
-	)
+	rows, err := tx.Query("SELECT id, timestamp, message, to_user, from_user FROM messages WHERE to_user = ? ORDER BY timestamp ASC", userID)
 	if err != nil {
 		return nil, err
 	}
@@ -235,11 +244,6 @@ func popMessages(userID string) ([]Message, error) {
 	return messages, tx.Commit()
 }
 
-// ---------------------------------------------------------------------------
-// WebSocket クライアント管理
-// ---------------------------------------------------------------------------
-
-// ClientConn は接続中のブラウザクライアントを表す。
 type ClientConn struct {
 	conn   *websocket.Conn
 	number string
@@ -252,28 +256,20 @@ func (c *ClientConn) send(v any) error {
 	return c.conn.WriteJSON(v)
 }
 
-var (
-	clients   = make(map[string]*ClientConn)
-	clientsMu sync.RWMutex
-)
-
-// deliverOrStore はオンラインなら即配信、オフラインなら DB に保存する。
 func deliverOrStore(msg *Message) error {
 	clientsMu.RLock()
 	target, online := clients[msg.To]
 	clientsMu.RUnlock()
 
 	if online {
-		err := target.send(map[string]any{"action": "messages", "messages": []Message{*msg}})
-		if err == nil {
+		if err := target.send(map[string]any{"action": "messages", "messages": []Message{*msg}}); err == nil {
 			return nil
 		}
-		log.Printf("deliver failed to %s, fallback to store: %v", msg.To, err)
+		log.Printf("deliver failed to %s, fallback to store", msg.To)
 	}
 	return storeMessage(msg)
 }
 
-// sendToClient は `to` のクライアントにシグナルを送る（接続中の場合のみ）。
 func sendToClient(to string, payload any) {
 	clientsMu.RLock()
 	target, ok := clients[to]
@@ -285,9 +281,6 @@ func sendToClient(to string, payload any) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// CORS ミドルウェア
-// ---------------------------------------------------------------------------
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -302,16 +295,12 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// ---------------------------------------------------------------------------
-// 定期クリーンアップ（3日以上古いメッセージを削除）
-// ---------------------------------------------------------------------------
-
 func startCleanup() {
 	go func() {
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
 		for range ticker.C {
-			res, err := db.Exec("DELETE FROM messages WHERE received_at < unixepoch() - 259200")
+			res, err := db.Exec("DELETE FROM messages WHERE received_at < UNIX_TIMESTAMP() - 259200")
 			if err != nil {
 				log.Printf("cleanup error: %v", err)
 				continue
@@ -323,11 +312,6 @@ func startCleanup() {
 	}()
 }
 
-// ---------------------------------------------------------------------------
-// HTTP ハンドラ: アカウント管理
-// ---------------------------------------------------------------------------
-
-// POST /account/new - ユーザー登録（ユーザー名 + パスワードのみ）
 func handleNew(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -355,7 +339,6 @@ func handleNew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ユーザー名の重複チェック
 	var exists int
 	if err := db.QueryRow("SELECT COUNT(*) FROM users WHERE username = ?", body.Username).Scan(&exists); err != nil {
 		log.Printf("db error: %v", err)
@@ -381,10 +364,7 @@ func handleNew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := db.Exec(
-		"INSERT INTO users (username, number, password_hash) VALUES (?, ?, ?)",
-		body.Username, number, string(hash),
-	); err != nil {
+	if _, err := db.Exec("INSERT INTO users (username, number, password_hash, created_at) VALUES (?, ?, ?, ?)", body.Username, number, string(hash), time.Now().UTC().Unix()); err != nil {
 		log.Printf("insert user error: %v", err)
 		http.Error(w, "registration failed", http.StatusInternalServerError)
 		return
@@ -394,7 +374,6 @@ func handleNew(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"number": number})
 }
 
-// POST /account/login - ログイン（ユーザー名 + パスワード）
 func handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -415,12 +394,8 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var number, passwordHash string
-	err := db.QueryRow(
-		"SELECT number, password_hash FROM users WHERE username = ?",
-		body.Username,
-	).Scan(&number, &passwordHash)
+	err := db.QueryRow("SELECT number, password_hash FROM users WHERE username = ?", body.Username).Scan(&number, &passwordHash)
 	if err != nil {
-		// タイミング攻撃を防ぐために一定時間消費する
 		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$invalidhashfortimingnormalization"), []byte(body.Password))
 		http.Error(w, "invalid username or password", http.StatusUnauthorized)
 		return
@@ -438,17 +413,9 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"token":  token,
-		"number": number,
-	})
+	json.NewEncoder(w).Encode(map[string]string{"token": token, "number": number})
 }
 
-// ---------------------------------------------------------------------------
-// HTTP ハンドラ: SMS 送信
-// ---------------------------------------------------------------------------
-
-// POST /sms/send - SMS 送信（JWT 必須）
 func handleSMSSend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -484,11 +451,6 @@ func handleSMSSend(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// ---------------------------------------------------------------------------
-// HTTP ハンドラ: ICE / 通話シグナリング（JWT 必須）
-// ---------------------------------------------------------------------------
-
-// handleSignal は from を JWT から取得して to のクライアントに action を中継する。
 func handleSignal(signalType string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -512,7 +474,6 @@ func handleSignal(signalType string) http.HandlerFunc {
 			http.Error(w, "to is required", http.StatusBadRequest)
 			return
 		}
-		// JWT から検証した from で body を上書き（なりすまし防止）
 		body["from"] = fromNumber
 
 		sendToClient(to, map[string]any{"action": signalType, "data": body})
@@ -520,11 +481,6 @@ func handleSignal(signalType string) http.HandlerFunc {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// WebSocket ハンドラ: クライアント接続（ブラウザ）
-// ---------------------------------------------------------------------------
-
-// GET /ws - ブラウザクライアントの WebSocket 接続
 func handleClientWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -533,7 +489,6 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	// 最初のメッセージで JWT 認証を受け取る
 	var authMsg struct {
 		Action string `json:"action"`
 		Number string `json:"number"`
@@ -573,12 +528,10 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 		log.Printf("client disconnected: %s", userID)
 	}()
 
-	// 認証成功を通知
 	if err := client.send(map[string]string{"status": "authenticated"}); err != nil {
 		return
 	}
 
-	// 保留メッセージを配信する
 	messages, err := popMessages(userID)
 	if err != nil {
 		log.Printf("popMessages error for %s: %v", userID, err)
@@ -588,7 +541,6 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 接続維持（クライアントからのメッセージは現在未使用）
 	for {
 		if _, _, err := conn.ReadMessage(); err != nil {
 			return
@@ -596,19 +548,12 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// 静的ファイルサーバー
-// ---------------------------------------------------------------------------
-
 func handleStatic(staticDir string) http.Handler {
 	dir := http.Dir(staticDir)
 	fs := http.FileServer(dir)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// http.Dir.Open sanitizes the path (resolves ".." etc.) and prevents
-		// traversal outside staticDir. Use it to test file existence safely.
 		f, err := dir.Open(r.URL.Path)
 		if err != nil {
-			// File not found → SPA フォールバック: index.html を返す
 			http.ServeFile(w, r, filepath.Join(staticDir, "index.html"))
 			return
 		}
@@ -617,19 +562,13 @@ func handleStatic(staticDir string) http.Handler {
 	})
 }
 
-// ---------------------------------------------------------------------------
-// メイン
-// ---------------------------------------------------------------------------
-
 func main() {
-	// JWT シークレット
 	jwtSecretStr := os.Getenv("JWT_SECRET")
 	if jwtSecretStr == "" {
 		log.Fatal("JWT_SECRET is required")
 	}
 	jwtSecret = []byte(jwtSecretStr)
 
-	// DB 初期化
 	if err := initDB(); err != nil {
 		log.Fatalf("db init failed: %v", err)
 	}
@@ -637,7 +576,6 @@ func main() {
 
 	startCleanup()
 
-	// ポートと TLS 設定
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "35000"
@@ -645,35 +583,23 @@ func main() {
 	certFile := os.Getenv("CERT_FILE")
 	keyFile := os.Getenv("KEY_FILE")
 
-	// 静的ファイルのディレクトリ（client/dist/ をコピーして配置する想定）
 	staticDir := os.Getenv("STATIC_DIR")
 	if staticDir == "" {
 		staticDir = "./static"
 	}
 
 	mux := http.NewServeMux()
-
-	// アカウント管理
 	mux.HandleFunc("/account/new", handleNew)
 	mux.HandleFunc("/account/login", handleLogin)
-
-	// SMS 送信（JWT 必須）
 	mux.HandleFunc("/sms/send", handleSMSSend)
-
-	// ICE シグナリング（JWT 必須）
 	mux.HandleFunc("/ice/offer", handleSignal("ice_offer"))
 	mux.HandleFunc("/ice/answer", handleSignal("ice_answer"))
 	mux.HandleFunc("/ice/candidate", handleSignal("ice_candidate"))
-
-	// 通話シグナリング（JWT 必須）
 	mux.HandleFunc("/call/auth-ok", handleSignal("call_auth_ok"))
 	mux.HandleFunc("/call/reject", handleSignal("call_reject"))
 	mux.HandleFunc("/call/hangup", handleSignal("call_hangup"))
-
-	// WebSocket（ブラウザクライアント接続）
 	mux.HandleFunc("/ws", handleClientWS)
 
-	// 静的ファイル（index.html / main.js 等）
 	if _, err := os.Stat(staticDir); err == nil {
 		mux.Handle("/", handleStatic(staticDir))
 		log.Printf("serving static files from %s", staticDir)
@@ -684,7 +610,6 @@ func main() {
 	}
 
 	handler := corsMiddleware(mux)
-
 	if certFile != "" && keyFile != "" {
 		log.Printf("smsandtell server listening on :%s (TLS)", port)
 		if err := http.ListenAndServeTLS(":"+port, certFile, keyFile, handler); err != nil {
