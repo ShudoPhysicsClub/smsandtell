@@ -16,6 +16,7 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -60,29 +61,32 @@ func initDB() error {
 	if err := db.Ping(); err != nil {
 		return fmt.Errorf("ping db: %w", err)
 	}
-	_, err = db.Exec(`
-		PRAGMA journal_mode=WAL;
-		PRAGMA foreign_keys=ON;
-
-		CREATE TABLE IF NOT EXISTS users (
-			username     TEXT PRIMARY KEY,
-			number       TEXT UNIQUE NOT NULL,
+	stmts := []string{
+		`PRAGMA journal_mode=WAL`,
+		`PRAGMA foreign_keys=ON`,
+		`CREATE TABLE IF NOT EXISTS users (
+			username      TEXT PRIMARY KEY,
+			number        TEXT UNIQUE NOT NULL,
 			password_hash TEXT NOT NULL,
-			created_at   INTEGER DEFAULT (unixepoch())
-		);
-
-		CREATE TABLE IF NOT EXISTS messages (
+			created_at    INTEGER DEFAULT (unixepoch())
+		)`,
+		`CREATE TABLE IF NOT EXISTS messages (
 			id          INTEGER PRIMARY KEY AUTOINCREMENT,
 			timestamp   INTEGER NOT NULL,
 			received_at INTEGER DEFAULT (unixepoch()),
 			message     TEXT NOT NULL,
 			to_user     TEXT NOT NULL,
 			from_user   TEXT NOT NULL
-		);
-		CREATE INDEX IF NOT EXISTS idx_msg_to   ON messages(to_user);
-		CREATE INDEX IF NOT EXISTS idx_msg_recv ON messages(received_at);
-	`)
-	return err
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_msg_to   ON messages(to_user)`,
+		`CREATE INDEX IF NOT EXISTS idx_msg_recv ON messages(received_at)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("db init: %w", err)
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -600,7 +604,10 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 func handleStatic(staticDir string) http.Handler {
 	fs := http.FileServer(http.Dir(staticDir))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fullPath := filepath.Join(staticDir, filepath.Clean(r.URL.Path))
+		// path.Clean("/" + ...) ensures the result is absolute and contains no ".." escapes.
+		// filepath.Join then keeps the result inside staticDir.
+		safePath := path.Clean("/" + r.URL.Path)
+		fullPath := filepath.Join(staticDir, filepath.FromSlash(safePath))
 		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
 			// SPA フォールバック: index.html を返す
 			http.ServeFile(w, r, filepath.Join(staticDir, "index.html"))
