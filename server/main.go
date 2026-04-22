@@ -16,7 +16,6 @@ import (
 	"math/big"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -602,17 +601,18 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 func handleStatic(staticDir string) http.Handler {
-	fs := http.FileServer(http.Dir(staticDir))
+	dir := http.Dir(staticDir)
+	fs := http.FileServer(dir)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// path.Clean("/" + ...) ensures the result is absolute and contains no ".." escapes.
-		// filepath.Join then keeps the result inside staticDir.
-		safePath := path.Clean("/" + r.URL.Path)
-		fullPath := filepath.Join(staticDir, filepath.FromSlash(safePath))
-		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-			// SPA フォールバック: index.html を返す
+		// http.Dir.Open sanitizes the path (resolves ".." etc.) and prevents
+		// traversal outside staticDir. Use it to test file existence safely.
+		f, err := dir.Open(r.URL.Path)
+		if err != nil {
+			// File not found → SPA フォールバック: index.html を返す
 			http.ServeFile(w, r, filepath.Join(staticDir, "index.html"))
 			return
 		}
+		f.Close()
 		fs.ServeHTTP(w, r)
 	})
 }
